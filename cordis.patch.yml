@@ -1,0 +1,7 @@
+- insert:
+    - id: dsh-context-bridge
+      name: 'dsh-context-bridge'
+      config:
+        enabled: false
+        thresholdTokens: 262144
+        todoLimit: 12
