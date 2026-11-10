@@ -16,8 +16,14 @@ import { join } from 'node:path'
 export const CONFIG_FILE = '.dsh-bridge.json'
 
 const DEFAULTS = {
-  /** 本项目的「上下文交接」入口是否可用。默认关闭。 */
-  enabled: false,
+  /**
+   * 默认开启：没有配置文件 = 可用。
+   *
+   * 为什么改成默认开：插件是手动触发的（人点菜单才执行），自动触发已经删掉了，
+   * 「没建文件就用不上」只会让新项目莫名其妙用不了。要关掉某个项目，
+   * 显式写 {"enabled": false} —— 开关保留，但默认放行。
+   */
+  enabled: true,
   /** 交接文档里最多列几条待办。 */
   todoLimit: 12,
   /** 最近几轮放进交接文档。 */
@@ -48,18 +54,19 @@ function pickNumber(value, fallback, min, max) {
   return rounded
 }
 
-/** 把磁盘上的原始配置规范化；坏文件一律按「关闭」处理，绝不因为配置错就让插件抛。 */
+/** 把磁盘上的原始配置规范化；坏文件一律按默认（开启）处理，绝不因为配置错就让插件抛。 */
 export function normalizeConfig(raw) {
   const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
   return {
-    enabled: source.enabled === true,
+    // 只有显式写 false 才关闭；没写、写坏、写别的都是开启。
+    enabled: source.enabled !== false,
     todoLimit: pickNumber(source.todoLimit, DEFAULTS.todoLimit, 1, 50),
     recentTurns: pickNumber(source.recentTurns, DEFAULTS.recentTurns, 0, 10),
     openNewSession: source.openNewSession !== false,
   }
 }
 
-/** 读一个项目的配置；文件缺失或损坏都返回默认（关闭）。 */
+/** 读一个项目的配置；文件缺失或损坏都返回默认（开启）。 */
 export async function readProjectConfig(projectRoot) {
   const file = configPathFor(projectRoot)
   if (!existsSync(file)) return { ...DEFAULTS, path: file, present: false }
@@ -73,9 +80,9 @@ export async function readProjectConfig(projectRoot) {
 }
 
 export function describeConfig(config) {
-  if (config.present === false) return '未配置（文件不存在 = 关闭）'
-  if (config.broken === true) return '配置文件无法解析，按关闭处理'
-  if (config.enabled !== true) return '已关闭'
+  if (config.enabled !== true) return '已关闭（本项目写了 enabled: false）'
+  if (config.broken === true) return '配置文件无法解析，已按默认开启（手动触发）'
+  if (config.present === false) return '已开启（默认，无配置文件）'
   return '已开启（手动触发）'
 }
 

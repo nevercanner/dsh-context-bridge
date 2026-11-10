@@ -84,7 +84,7 @@ async function manualHandoff(ctx, logger, { sessionId, projectRoot }) {
     if (config.enabled !== true) {
       return {
         ok: false,
-        detail: `本项目未开启交接：在 ${root} 下建 ${config.path ?? '.dsh-bridge.json'} 并写 {"enabled": true}`,
+        detail: `本项目已关闭交接：把 ${root} 下的 .dsh-bridge.json 改成 {"enabled": true}，或直接删掉该文件（删除后默认开启）`,
       }
     }
     const result = await runHandoff(ctx, { sourceSessionId: sessionId, agent, projectRoot: root, config, randomUUID })

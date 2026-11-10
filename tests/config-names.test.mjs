@@ -11,11 +11,18 @@ async function tempProject() {
   return dir
 }
 
-test('normalizeConfig 默认关闭', () => {
+test('normalizeConfig 默认开启（未配置即可用）', () => {
   const config = normalizeConfig({})
-  assert.equal(config.enabled, false)
+  assert.equal(config.enabled, true)
   assert.equal(config.todoLimit, CONFIG_DEFAULTS.todoLimit)
   assert.equal(config.recentTurns, CONFIG_DEFAULTS.recentTurns)
+})
+
+test('只有显式 false 才关闭', () => {
+  assert.equal(normalizeConfig({ enabled: false }).enabled, false)
+  assert.equal(normalizeConfig({ enabled: 'false' }).enabled, true)
+  assert.equal(normalizeConfig({ enabled: 0 }).enabled, true)
+  assert.equal(normalizeConfig({}).enabled, true)
 })
 
 test('配置里没有自动触发参数（纯手动）', () => {
@@ -31,17 +38,17 @@ test('normalizeConfig 夹紧越界条数', () => {
   assert.equal(normalizeConfig({ recentTurns: 99 }).recentTurns, 10)
 })
 
-test('normalizeConfig 对垃圾输入不抛', () => {
-  assert.equal(normalizeConfig(null).enabled, false)
-  assert.equal(normalizeConfig([]).enabled, false)
-  assert.equal(normalizeConfig('x').enabled, false)
+test('normalizeConfig 对垃圾输入不抛，且按默认开启', () => {
+  assert.equal(normalizeConfig(null).enabled, true)
+  assert.equal(normalizeConfig([]).enabled, true)
+  assert.equal(normalizeConfig('x').enabled, true)
 })
 
-test('readProjectConfig 文件不存在 = 关闭', async () => {
+test('readProjectConfig 文件不存在 = 默认开启', async () => {
   const dir = await tempProject()
   try {
     const config = await readProjectConfig(dir)
-    assert.equal(config.enabled, false)
+    assert.equal(config.enabled, true)
     assert.equal(config.present, false)
     assert.equal(config.path, configPathFor(dir))
   } finally {
@@ -62,12 +69,12 @@ test('readProjectConfig 读到 enabled=true', async () => {
   }
 })
 
-test('readProjectConfig 坏 JSON 按关闭且不抛', async () => {
+test('readProjectConfig 坏 JSON 按默认开启且不抛', async () => {
   const dir = await tempProject()
   try {
     await writeFile(join(dir, '.dsh-bridge.json'), '{ not json')
     const config = await readProjectConfig(dir)
-    assert.equal(config.enabled, false)
+    assert.equal(config.enabled, true)
     assert.equal(config.broken, true)
   } finally {
     await rm(dir, { recursive: true, force: true })

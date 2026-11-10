@@ -13,7 +13,8 @@ agent loop. This is deliberate: when context fills up the first move is to
 compact, and only after several rounds of compaction stop helping is a handoff
 the right last step. That judgement is yours, not a number's.
 
-Default **off**. A project opts in by creating `.dsh-bridge.json` in its root.
+Default **on**: no config file means the menu row works. To turn a project off,
+write `{"enabled": false}` in `<project>/.dsh-bridge.json`.
 
 ---
 

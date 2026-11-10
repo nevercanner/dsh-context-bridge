@@ -134,24 +134,25 @@ async function main() {
   check('有 status 路由', statusRoute !== undefined)
   check('有 run 路由', runRoute !== undefined)
 
-  console.log('2) 未配置时 status 报「未配置」且 enabled=false')
+  console.log('2) 未配置时默认开启（新项目装上就能用）')
   const res1 = fakeRes()
   await statusRoute.handler(fakeReq({ url: `/plugins/dsh-context-bridge/status?session=session-src` }), res1)
   const body1 = JSON.parse(res1.body)
   check('HTTP 200', res1.statusCode === 200, `实际 ${res1.statusCode}`)
-  check('enabled=false', body1.enabled === false)
-  check('状态含「未配置」', String(body1.status).includes('未配置'), body1.status)
+  check('enabled=true（默认开）', body1.enabled === true, String(body1.enabled))
+  check('状态说明是默认开启', String(body1.status).includes('默认'), body1.status)
   check('projectRoot 指向临时目录', String(body1.projectRoot).replace(/\\/g, '/').startsWith(dir.replace(/\\/g, '/')), body1.projectRoot)
 
-  console.log('3) 未开启时手动 /run 被拒，且不建任何东西')
+  console.log('3) 项目显式关掉时手动 /run 被拒，且不建任何东西')
+  await writeFile(join(dir, '.dsh-bridge.json'), JSON.stringify({ enabled: false }))
   const res0 = fakeRes()
   await runRoute.handler(
     fakeReq({ method: 'POST', url: '/plugins/dsh-context-bridge/run', body: { session: 'session-src' } }),
     res0,
   )
   const body0 = JSON.parse(res0.body)
-  check('未开启时 ok=false', body0.ok === false, res0.body.slice(0, 120))
-  check('提示里给出开启方式', String(body0.detail).includes('.dsh-bridge.json'), body0.detail)
+  check('关闭时 ok=false', body0.ok === false, res0.body.slice(0, 120))
+  check('提示里给出恢复方式', String(body0.detail).includes('.dsh-bridge.json'), body0.detail)
   check('没有建会话', created.length === 0, `实际 ${created.length}`)
 
   console.log('4) 开启后手动 /run 能建会话并投递文档')
