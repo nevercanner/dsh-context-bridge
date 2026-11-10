@@ -171,6 +171,8 @@ export async function registerBaseName(ctx, { projectRoot, sessionId, name }) {
 /**
  * 执行一次交接：建会话 → 起名 → 推文档。
  *
+ * 只由「人点了按钮」那条路径调用（HTTP /run），没有别的调用者。
+ *
  * @param {object} ctx 宿主 context
  * @param {object} input
  * @param {string} input.sourceSessionId 源会话

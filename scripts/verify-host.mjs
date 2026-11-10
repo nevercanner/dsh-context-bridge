@@ -125,7 +125,7 @@ async function main() {
   } catch (error) {
     check('apply 未抛异常', false, String(error))
   }
-  check('注册了 agent/turn-stopping', listeners.has('agent/turn-stopping'))
+  check('没有注册任何事件监听（纯手动，不自动触发）', listeners.size === 0, `实际 ${listeners.size}: ${[...listeners.keys()].join(',')}`)
   check('注册了 2 条路由', routes.size === 2, `实际 ${routes.size}`)
   check('注册了生命周期清理', disposers.length === 1)
 
@@ -143,12 +143,19 @@ async function main() {
   check('状态含「未配置」', String(body1.status).includes('未配置'), body1.status)
   check('projectRoot 指向临时目录', String(body1.projectRoot).replace(/\\/g, '/').startsWith(dir.replace(/\\/g, '/')), body1.projectRoot)
 
-  console.log('3) 未开启时自动触发不做任何事')
-  listeners.get('agent/turn-stopping')({ agent: { session: { id: 'session-src' } } })
-  await new Promise((r) => setTimeout(r, 60))
+  console.log('3) 未开启时手动 /run 被拒，且不建任何东西')
+  const res0 = fakeRes()
+  await runRoute.handler(
+    fakeReq({ method: 'POST', url: '/plugins/dsh-context-bridge/run', body: { session: 'session-src' } }),
+    res0,
+  )
+  const body0 = JSON.parse(res0.body)
+  check('未开启时 ok=false', body0.ok === false, res0.body.slice(0, 120))
+  check('提示里给出开启方式', String(body0.detail).includes('.dsh-bridge.json'), body0.detail)
   check('没有建会话', created.length === 0, `实际 ${created.length}`)
 
-  console.log('4) 开启后手工 /run 能建会话并投递文档')
+  console.log('4) 开启后手动 /run 能建会话并投递文档')
+  await writeFile(join(dir, '.dsh-bridge.json'), JSON.stringify({ enabled: true }))
   const res2 = fakeRes()
   await runRoute.handler(
     fakeReq({ method: 'POST', url: '/plugins/dsh-context-bridge/run', body: { session: 'session-src' } }),

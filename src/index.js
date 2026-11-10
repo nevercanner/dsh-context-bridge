@@ -1,15 +1,19 @@
 /**
- * host 半 —— 挂载点、HTTP 路由、自动触发。
+ * host 半 —— 纯手动交接。
+ *
+ * 这里**没有**任何自动触发：不监听任何 agent 生命周期事件，不看 token 用量，
+ * 没有阈值、没有冷却、没有定时器。交接只在你点菜单里的那一行时发生。
+ *
+ * 为什么这样设计：上下文快满时，第一件事应该是压缩（`/compact` 或自动压缩），
+ * 压缩多轮后仍然压不动，交接才是最后一步 —— 这个判断只有人能做，
+ * 一个阈值猜不出来，猜错的结果是「还能压一压的会话被提前抛弃」。
  *
  * 设计约束（来自 2026-11-09 的真实事故）：
- *   1. **不注册任何 DOM 兜底**。上一版 dsh-session-send 之所以把「切换模型」
- *      搞成主线程死锁，是因为它用 MutationObserver 扫描所有 role="menu"，
- *      然后把自建节点 appendChild 进 React 管理的容器 —— React 下一次渲染
- *      抹掉它，observer 再插一次，形成插入/渲染自激。本插件的 Client 半
- *      只用官方 slot，零 MutationObserver、零 appendChild 到 React 容器。
- *   2. **不在运行中改 client 文件**。Client 半的改动必须整机重启才生效，
- *      否则分块 rev 失配 → web boot failed。
- *   3. 所有宿主服务都用 ctx.get() + try 兜底读取，不做静态 import，
+ *   1. **不注册任何 DOM 兜底**。dsh-session-send 曾用 DOM 变更观察器扫描
+ *      所有 role="menu"，再把自建节点塞进 React 管理的容器 —— React 下一次
+ *      渲染抹掉它，观察器再插一次，打开模型菜单就把渲染进程主线程锁死。
+ *   2. Client 半只用官方 slot，改动需整机重启才生效（运行中改会 rev 失配）。
+ *   3. 宿主服务一律 ctx.get() + try 兜底读取，不做静态 import，
  *      也绝不裸读 ctx.xxx（未声明 inject 时会抛）。
  */
 
@@ -20,10 +24,10 @@ import { randomUUID } from 'node:crypto'
 
 export const name = 'dsh-context-bridge'
 export const description =
-  '会话交接：把项目事实、上下文摘要与待办压成一份交接文档，自动开新会话并把文档作为第一轮投入，' +
-  '新会话可继承会话总线的注册名。默认关闭，按项目在 .dsh-bridge.json 里开启。'
+  '会话交接（手动）：在你点「上下文交接」的那一刻，把项目事实、上下文摘要与待办压成一份交接文档，' +
+  '新建会话并把文档作为第一轮投入，让它接着干；新会话可继承会话总线的注册名。不按阈值自动触发。'
 
-/** 只需要 tools 与 webServer 可选；其余全部 ctx.get 兜底。 */
+/** 不需要任何必需服务；其余全部 ctx.get 兜底。 */
 export const inject = []
 
 function get(ctx, key) {
@@ -40,26 +44,8 @@ function get(ctx, key) {
   }
 }
 
-/** 每个会话的自动交接节流状态：最后触发时间。 */
-const lastRunAt = new Map()
-/** 正在交接的会话，防重入。 */
+/** 正在交接的会话，防重复点击。 */
 const inFlight = new Set()
-
-function limitOf(ctx) {
-  const limit = get(ctx, 'tokenMeter')
-  return typeof limit?.measure === 'function' ? limit : undefined
-}
-
-function totalTokens(ctx, agent) {
-  const meter = limitOf(ctx)
-  if (meter === undefined) return 0
-  try {
-    const measured = meter.measure(agent.session)
-    return typeof measured?.totalTokens === 'number' ? measured.totalTokens : 0
-  } catch {
-    return 0
-  }
-}
 
 async function projectRootOf(ctx, agent) {
   if (agent !== undefined) {
@@ -79,59 +65,42 @@ async function projectRootOf(ctx, agent) {
 }
 
 /**
- * 自动触发：在 `agent/turn-stopping` 时看一次上下文用量。
- *
- * 为什么是 turn-stopping 而不是 pre-step：交接要在**一轮结束后**做，
- * 否则会把半截工作当成结论写进文档，而且新会话会被同一轮的后续 step 干扰。
+ * 手工触发（侧栏菜单 / 面板按钮走这里）。
+ * 只有人被点的那一下才调用；没有别的地方会调用它。
  */
-async function maybeAutoHandoff(ctx, agent, logger) {
-  const sessionId = agent?.session?.id ?? agent?.id
-  if (typeof sessionId !== 'string' || sessionId === '') return
-  if (inFlight.has(sessionId)) return
-
-  const projectRoot = await projectRootOf(ctx, agent)
-  if (projectRoot === undefined) return
-  const config = await readProjectConfig(projectRoot)
-  if (config.enabled !== true) return
-
-  const total = totalTokens(ctx, agent)
-  if (total < config.thresholdTokens) return
-
-  const previous = lastRunAt.get(sessionId) ?? 0
-  if (Date.now() - previous < config.minIntervalMs) {
-    logger?.info?.(`[dsh-context-bridge] ${sessionId} 到达阈值但仍在节流窗口内，跳过`)
-    return
+async function manualHandoff(ctx, logger, { sessionId, projectRoot }) {
+  if (inFlight.has(sessionId)) {
+    return { ok: false, detail: '这个会话的交接正在进行中，请稍候' }
   }
-
   inFlight.add(sessionId)
   try {
-    const result = await runHandoff(ctx, { sourceSessionId: sessionId, agent, projectRoot, config, randomUUID })
-    lastRunAt.set(sessionId, Date.now())
+    const agents = get(ctx, 'agents')
+    const agent = typeof agents?.get === 'function' ? agents.get(sessionId) : undefined
+    const root = projectRoot ?? (await projectRootOf(ctx, agent))
+    if (root === undefined) {
+      return { ok: false, detail: '无法确定该会话所属项目，交接已取消（没有创建任何东西）' }
+    }
+    const config = await readProjectConfig(root)
+    if (config.enabled !== true) {
+      return {
+        ok: false,
+        detail: `本项目未开启交接：在 ${root} 下建 ${config.path ?? '.dsh-bridge.json'} 并写 {"enabled": true}`,
+      }
+    }
+    const result = await runHandoff(ctx, { sourceSessionId: sessionId, agent, projectRoot: root, config, randomUUID })
     if (result.ok) {
       logger?.info?.(
-        `[dsh-context-bridge] 已为 ${sessionId} 建立交接会话 ${result.sessionId}` +
-          (result.name === undefined ? '' : `（名「${result.name}」）`) +
-          `：${result.detail}`,
+        `[dsh-context-bridge] 手动交接完成：${sessionId} → ${result.sessionId}` +
+          (result.name === undefined ? '' : `（名「${result.name}」）`),
       )
-    } else {
-      logger?.warn?.(`[dsh-context-bridge] 自动交接失败：${result.detail}`)
     }
+    return result
   } catch (error) {
-    logger?.warn?.(`[dsh-context-bridge] 自动交接异常：${String(error)}`)
+    logger?.warn?.(`[dsh-context-bridge] 手动交接异常：${String(error)}`)
+    return { ok: false, detail: String(error) }
   } finally {
     inFlight.delete(sessionId)
   }
-}
-
-/** 手工触发（侧栏开关走这里）。 */
-async function manualHandoff(ctx, { sessionId, projectRoot }) {
-  const agents = get(ctx, 'agents')
-  const agent = typeof agents?.get === 'function' ? agents.get(sessionId) : undefined
-  const root = projectRoot ?? (await projectRootOf(ctx, agent))
-  if (root === undefined) throw new Error('无法确定项目根')
-  const config = await readProjectConfig(root)
-  const result = await runHandoff(ctx, { sourceSessionId: sessionId, agent, projectRoot: root, config, randomUUID })
-  return { ...result, ...(result.ok ? {} : { error: result.detail }) }
 }
 
 // ───────────────────────────── HTTP 路由 ─────────────────────────────
@@ -196,9 +165,11 @@ function routesFor(ctx, logger) {
         return sendJson(res, 200, {
           enabled: config.enabled === true,
           status: describeConfig(config),
+          mode: 'manual',
           projectRoot,
           projectName: projectRoot.split(/[\\/]/).filter(Boolean).pop() ?? '',
-          thresholdTokens: config.thresholdTokens,
+          todoLimit: config.todoLimit,
+          recentTurns: config.recentTurns,
           busName: busName ?? null,
           namesPath: namesPathFor(projectRoot),
           sessionId,
@@ -220,51 +191,34 @@ function routesFor(ctx, logger) {
             return sendJson(res, 400, { error: { code: 'E_PROJECT', message: String(error) } })
           }
         }
-        try {
-          const result = await manualHandoff(ctx, { sessionId, projectRoot: root })
-          return sendJson(res, result.ok ? 200 : 500, result)
-        } catch (error) {
-          logger?.warn?.(`[dsh-context-bridge] /run 失败：${String(error)}`)
-          return sendJson(res, 500, { ok: false, error: String(error) })
-        }
+        const result = await manualHandoff(ctx, logger, { sessionId, projectRoot: root })
+        return sendJson(res, result.ok ? 200 : 500, result)
       },
     },
   ]
 }
 
 /**
- * 插件入口。
+ * 插件入口。挂两条 HTTP 路由，别的什么都不做 —— 没有事件监听。
  *
  * @param ctx 宿主 context
- * @param rawConfig 组合文件里的 config（enabled 等；项目级开关以 .dsh-bridge.json 为准）
+ * @param rawConfig 组合文件里的 config
  */
 export function apply(ctx, rawConfig = {}) {
   const logger = get(ctx, 'logger')
   const config = rawConfig !== null && typeof rawConfig === 'object' ? rawConfig : {}
   if (config.enabled === false) {
-    logger?.debug?.('[dsh-context-bridge] 组合层 enabled=false，插件只装载不工作（要工作时在 .dsh-bridge.json 打开）')
+    logger?.debug?.('[dsh-context-bridge] 组合层 enabled=false（项目开关以 .dsh-bridge.json 为准）')
   }
 
-  // 自动触发
   const disposers = []
   try {
-    const off = ctx.on?.('agent/turn-stopping', (payload) => {
-      const agent = payload?.agent
-      if (agent === undefined) return
-      void maybeAutoHandoff(ctx, agent, logger)
-    })
-    if (typeof off === 'function') disposers.push(off)
-  } catch (error) {
-    logger?.warn?.(`[dsh-context-bridge] 注册 turn-stopping 失败：${String(error)}`)
-  }
-
-  // HTTP 路由（Client 半用它读写开关/触发）
-  let injected = false
-  try {
     ctx.inject?.(['webServer'], () => {
-      injected = true
       const webServer = get(ctx, 'webServer') ?? get(ctx, 'httpServer')
-      if (webServer === undefined || typeof webServer.register !== 'function') return
+      if (webServer === undefined || typeof webServer.register !== 'function') {
+        logger?.warn?.('[dsh-context-bridge] 宿主没有 webServer，侧栏入口将无法读取状态')
+        return
+      }
       for (const route of routesFor(ctx, logger)) {
         try {
           const dispose = webServer.register({
@@ -303,11 +257,8 @@ export function apply(ctx, rawConfig = {}) {
         // 忽略卸载异常
       }
     }
-    lastRunAt.clear()
     inFlight.clear()
   }, 'dsh-context-bridge: lifetime')
 
-  logger?.info?.(
-    `[dsh-context-bridge] 已装载（routes=${injected ? 'on' : 'off'}；开关以各项目 .dsh-bridge.json 为准）`,
-  )
+  logger?.info?.('[dsh-context-bridge] 已装载（手动触发：不注册任何自动监听）')
 }

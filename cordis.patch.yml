@@ -2,6 +2,6 @@
     - id: dsh-context-bridge
       name: 'dsh-context-bridge'
       config:
-        enabled: false
-        thresholdTokens: 262144
-        todoLimit: 12
+        # 手动触发：本插件不注册任何自动监听。项目开关见 <项目>/.dsh-bridge.json
+        # （未声明 inject，只挂两条 HTTP 路由，apply 里不依赖任何必需服务）。
+        enabled: true

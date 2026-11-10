@@ -14,14 +14,21 @@ async function tempProject() {
 test('normalizeConfig 默认关闭', () => {
   const config = normalizeConfig({})
   assert.equal(config.enabled, false)
-  assert.equal(config.autoContinue, true)
-  assert.equal(config.thresholdTokens, CONFIG_DEFAULTS.thresholdTokens)
+  assert.equal(config.todoLimit, CONFIG_DEFAULTS.todoLimit)
+  assert.equal(config.recentTurns, CONFIG_DEFAULTS.recentTurns)
 })
 
-test('normalizeConfig 夹紧越界阈值', () => {
-  assert.equal(normalizeConfig({ thresholdTokens: 1 }).thresholdTokens, 8192)
-  assert.equal(normalizeConfig({ thresholdTokens: 1e12 }).thresholdTokens, 10000000)
+test('配置里没有自动触发参数（纯手动）', () => {
+  const config = normalizeConfig({ enabled: true, thresholdTokens: 1234, autoContinue: true, minIntervalMs: 5 })
+  assert.equal('thresholdTokens' in config, false, '手动模式下不应有阈值参数')
+  assert.equal('autoContinue' in config, false, '手动模式下不应有 autoContinue')
+  assert.equal('minIntervalMs' in config, false, '手动模式下不应有冷却参数')
+})
+
+test('normalizeConfig 夹紧越界条数', () => {
   assert.equal(normalizeConfig({ todoLimit: 0 }).todoLimit, 1)
+  assert.equal(normalizeConfig({ todoLimit: 999 }).todoLimit, 50)
+  assert.equal(normalizeConfig({ recentTurns: 99 }).recentTurns, 10)
 })
 
 test('normalizeConfig 对垃圾输入不抛', () => {
@@ -45,10 +52,10 @@ test('readProjectConfig 文件不存在 = 关闭', async () => {
 test('readProjectConfig 读到 enabled=true', async () => {
   const dir = await tempProject()
   try {
-    await writeFile(join(dir, '.dsh-bridge.json'), JSON.stringify({ enabled: true, thresholdTokens: 4096 }))
+    await writeFile(join(dir, '.dsh-bridge.json'), JSON.stringify({ enabled: true, todoLimit: 99 }))
     const config = await readProjectConfig(dir)
     assert.equal(config.enabled, true)
-    assert.equal(config.thresholdTokens, 8192)
+    assert.equal(config.todoLimit, 50)
     assert.equal(config.present, true)
   } finally {
     await rm(dir, { recursive: true, force: true })

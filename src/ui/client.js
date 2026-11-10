@@ -217,14 +217,18 @@ window.__ModuleLoader__.load({
       const rows = [
         ['项目', body?.projectName ?? '—'],
         ['开关', body?.status ?? (state.loading ? '读取中…' : '—')],
-        ['阈值', body?.thresholdTokens === undefined ? '—' : String(body.thresholdTokens)],
+        ['触发', '手动（点按钮才执行）'],
         ['总线名', body?.busName ?? '（未注册）'],
       ]
 
       return h(
         'div',
         { style: { padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 12, font: 'inherit' } },
-        h('div', { style: { fontSize: 13, opacity: 0.7 } }, '把当前会话压成交接文档，自动开一个会话继续。开关按项目生效。'),
+        h(
+          'div',
+          { style: { fontSize: 13, opacity: 0.7 } },
+          '把当前会话压成交接文档，开一个新会话继续。不会自动触发 —— 上下文快满时先压缩，压不动了再点这里。',
+        ),
         state.error !== ''
           ? h('div', { style: { color: '#d66', fontSize: 13 } }, state.error)
           : null,

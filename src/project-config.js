@@ -1,10 +1,12 @@
 /**
  * 项目级配置 —— 与 dsh-session-send 同款：每个项目自己的 .dsh-bridge.json。
  *
- * 默认关闭。开关只有三档语义：
- *   · 文件不存在 / enabled !== true  → 不工作，侧栏入口只显示「未开启」
- *   · enabled === true               → 打开后，在满足条件时生成交接文档并开新会话
- *   · autoContinue === false         → 只生成文档，不自动开新会话（让人自己决定）
+ * **纯手动**：本插件没有任何按阈值自动触发。交接只在你于会话行菜单里点
+ * 「上下文交接」时发生。原因：上下文快满时，第一件事应该是压缩；
+ * 只有压缩多轮之后确实压不动了，交接才是最后一步 —— 那个判断只有人能做。
+ *
+ * 所以配置里不带任何自动触发参数：阈值、冷却、自动续接这类键在这里都不存在，
+ * 因为手动模式下它们不该有。
  */
 
 import { existsSync, statSync } from 'node:fs'
@@ -14,22 +16,20 @@ import { join } from 'node:path'
 export const CONFIG_FILE = '.dsh-bridge.json'
 
 const DEFAULTS = {
+  /** 本项目的「上下文交接」入口是否可用。默认关闭。 */
   enabled: false,
-  autoContinue: true,
-  /** 触发阈值：上下文到达这个 token 数就在**回合结束时**做交接。 */
-  thresholdTokens: 262144,
   /** 交接文档里最多列几条待办。 */
   todoLimit: 12,
   /** 最近几轮放进交接文档。 */
   recentTurns: 3,
-  /** 同一会话两次自动交接的最小间隔（毫秒），防止连发。 */
-  minIntervalMs: 600000,
+  /** 交接后是否自动把界面切到新会话（只是导航，不涉及任何后台触发）。 */
+  openNewSession: true,
 }
 
 export function normalizeRoot(value) {
   const raw = typeof value === 'string' ? value.trim() : ''
   if (raw === '') throw new Error('缺少项目根目录')
-  let normalized = raw.replace(/\\/g, '/').replace(/\/+$/, '')
+  const normalized = raw.replace(/\\/g, '/').replace(/\/+$/, '')
   if (normalized === '') throw new Error('项目根目录不合法')
   if (!existsSync(normalized)) throw new Error(`项目目录不存在：${normalized}`)
   if (!statSync(normalized).isDirectory()) throw new Error(`不是目录：${normalized}`)
@@ -53,11 +53,9 @@ export function normalizeConfig(raw) {
   const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
   return {
     enabled: source.enabled === true,
-    autoContinue: source.autoContinue !== false,
-    thresholdTokens: pickNumber(source.thresholdTokens, DEFAULTS.thresholdTokens, 8192, 10000000),
     todoLimit: pickNumber(source.todoLimit, DEFAULTS.todoLimit, 1, 50),
     recentTurns: pickNumber(source.recentTurns, DEFAULTS.recentTurns, 0, 10),
-    minIntervalMs: pickNumber(source.minIntervalMs, DEFAULTS.minIntervalMs, 0, 86400000),
+    openNewSession: source.openNewSession !== false,
   }
 }
 
@@ -78,7 +76,7 @@ export function describeConfig(config) {
   if (config.present === false) return '未配置（文件不存在 = 关闭）'
   if (config.broken === true) return '配置文件无法解析，按关闭处理'
   if (config.enabled !== true) return '已关闭'
-  return '已开启'
+  return '已开启（手动触发）'
 }
 
 export const CONFIG_DEFAULTS = DEFAULTS
