@@ -21,6 +21,35 @@ window.__ModuleLoader__.load({
 
     const NS = 'dsh-context-bridge'
 
+    /** 由 apply(ctx) 注入：交接成功后切换到新会话的宿主 API（uiWorkspace.openSession）。 */
+    let openSessionInHost = undefined
+
+    /**
+     * 交接成功后切到新会话。遵循项目配置 openNewSession（host 侧已解析，这里通过
+     * 全局默认 true 兜底；若当前宿主未提供 uiWorkspace 则安全跳过 —— 新建会话本身
+     * 已完成并且已持久化，切不切换只是视图导航）。
+     */
+    async function revealNewSession(sessionId) {
+      if (typeof sessionId !== 'string' || sessionId === '') return
+      try {
+        if (typeof openSessionInHost === 'function') {
+          openSessionInHost(sessionId)
+        } else {
+          // 兜底：通过 location.search 的 session 参数通知宿主侧栏（仅当宿主支持）
+          try {
+            const url = new URL(window.location.href)
+            url.searchParams.set('session', sessionId)
+            window.history.replaceState({}, '', url.toString())
+          } catch {
+            // 忽略：宿主不支持 URL 导航
+          }
+        }
+      } catch (error) {
+        // 切换失败不阻断 —— 交接文档已经建好，会话在磁盘上，用户可自行切过去。
+        console.info('[dsh-context-bridge] 切换新会话失败（可忽略，会话已创建）:', String(error))
+      }
+    }
+
     function api(path, options) {
       const init = {
         credentials: 'same-origin',
@@ -112,7 +141,10 @@ window.__ModuleLoader__.load({
             body: JSON.stringify({ session: sessionId }),
           })
           const name = typeof body?.name === 'string' && body.name !== '' ? `「${body.name}」` : ''
+          const newId = typeof body?.sessionId === 'string' ? body.sessionId : ''
           setResult(`已开新会话${name}`)
+          // 交接成功后真正切到新会话（config.openNewSession 默认 true）
+          await revealNewSession(newId)
         } catch (error) {
           setResult(`失败：${String(error?.message ?? error)}`)
         } finally {
@@ -206,6 +238,8 @@ window.__ModuleLoader__.load({
             `已建立交接会话 ${body?.sessionId ?? ''}${body?.name ? `（名「${body.name}」）` : ''}：${body?.detail ?? ''}`,
           )
           reload()
+          // 交接成功后真正切到新会话
+          await revealNewSession(typeof body?.sessionId === 'string' ? body.sessionId : '')
         } catch (error) {
           setResult(`失败：${String(error?.message ?? error)}`)
         } finally {
@@ -272,9 +306,13 @@ window.__ModuleLoader__.load({
     }
 
     return {
-      inject: ['slots'],
+      inject: ['slots', 'uiWorkspace'],
       apply(ctx) {
         const slots = ctx?.slots
+        // 交接成功后切换到新会话的宿主能力；openSession(target) —— target 是 session id。
+        openSessionInHost = typeof ctx?.uiWorkspace?.openSession === 'function'
+          ? (sessionId) => ctx.uiWorkspace.openSession(sessionId)
+          : undefined
         if (slots === undefined || typeof slots.inject !== 'function' || typeof slots.register !== 'function') {
           return
         }

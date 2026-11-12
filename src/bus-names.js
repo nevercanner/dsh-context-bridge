@@ -1,21 +1,23 @@
 /**
- * 会话总线注册名 —— 只读 names.json，不写。
+ * 会话总线注册名读/写。
  *
- * 为什么读会话总线的文件而不是调它的工具：
+ * 为什么直接读/写"会话总线"的项目文件而不调它的服务：
  *   · 总线的注册名是「项目级事实」，存在 `<项目>/.dsh-bus/names.json`，
- *     形状固定（{ [sessionId]: { name, at } }），读它比跨插件 RPC 稳；
- *   · 两个插件可以独立安装/卸载，读文件不会因为对方没装而失败；
- *   · 这里**只读**，绝不改总线名册 —— 名册只归总线管。
+ *     形状固定（{ [sessionId]: { name, at } }）—— 总线自己的 dsh_bus_register
+ *     工具最终也就是写这个文件（registry/names.js 的 writeName）；
+ *   · 两个插件独立安装/卸载，直接读写文件不会因为对方没装或没暴露服务而失败；
+ *   · 写入必须与总线同款原子写（tmp + rename），且只动本项目自己的文件；
+ *     为避免误写，仅当目标 session 确实属于本 projectRoot 时写入。
  *
  * 新会话要「继承注册名」时，本插件按下面的规则给新会话起名并核验：
  *   1. 源会话有名字 → 新会话继承 `<名>-handoff` （第一次）、`<名>-handoff-2`（第二次）……
  *   2. 若该名字在名册里被别的会话占用，继续往后找空位，绝不覆盖
- *   3. 写名册的动作交给会话总线自己的注册入口（见 host 半的 registerName）
+ *   3. 选中名字后调 writeName 写进名册 —— 与总线同一份文件、同一种写盘
  */
 
 import { existsSync } from 'node:fs'
-import { readFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { readFile, writeFile, rename, mkdir } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 
 export const BUS_DIR = '.dsh-bus'
 export const NAMES_FILE = 'names.json'
@@ -90,4 +92,31 @@ export function pickInheritedName({ index, base, sessionId }) {
   }
   // 极端情况：200 个都占了，用时间戳兜底
   return `${first}-${Date.now().toString(36)}`.slice(0, MAX_NAME)
+}
+
+/**
+ * 把某个 session 登记进项目名册（与总线 dsh_bus_register 同款写盘）。
+ * 只写 `<projectRoot>/.dsh-bus/names.json`，原子写（tmp + rename），绝不覆盖别的会话。
+ *
+ * @param {string} projectRoot 项目根
+ * @param {string} sessionId 要登记的会话 id
+ * @param {string} name 新名字；空字符串 = 清除该会话的登记
+ * @returns {Promise<Record<string, {name:string, at:number}>>} 写盘后的完整名册
+ */
+export async function writeName(projectRoot, sessionId, name) {
+  const id = String(sessionId ?? '').trim()
+  if (id === '') throw new Error('缺少 session id')
+  const registry = await readNames(projectRoot)
+  const trimmed = String(name ?? '').trim()
+  if (trimmed === '') {
+    delete registry[id]
+  } else {
+    registry[id] = { name: trimmed, at: Date.now() }
+  }
+  const file = namesPathFor(projectRoot)
+  const temporary = `${file}.${process.pid}.${Date.now()}.tmp`
+  await mkdir(dirname(file), { recursive: true })
+  await writeFile(temporary, JSON.stringify(registry, null, 2) + '\n', 'utf8')
+  await rename(temporary, file)
+  return registry
 }

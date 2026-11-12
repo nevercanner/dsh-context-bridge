@@ -39,8 +39,11 @@ test('client 半不含任何会与 React 自激的 DOM 模式', async () => {
 
 test('client 半只通过 slots 注册 UI', async () => {
   const source = await readFile(clientPath, 'utf8')
-  assert.ok(source.includes("inject: ['slots']"), '必须声明 inject: [\'slots\']')
+  // inject 必须包含 slots；uiWorkspace 是官方暴露的会话导航服务（schedule/workflow-run
+  // 等同款插件也在用），用于交接成功后把界面切到新会话 —— 它不触碰宿主 DOM，不违禁。
+  assert.ok(source.includes("inject: ['slots', 'uiWorkspace']"), "必须声明 inject: ['slots', 'uiWorkspace']")
   assert.ok(source.includes('slots.register'), '必须用 slots.register 注册界面')
+  assert.ok(source.includes('uiWorkspace.openSession'), '交接成功后必须调用 uiWorkspace.openSession 切换会话')
 })
 
 test('client 半的菜单行是 role=menuitem 的普通 button', async () => {

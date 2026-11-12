@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { makeHandoffEvent, makeSessionId, runHandoff, seedAndWake } from '../src/handoff-host.js'
+import { readNames } from '../src/bus-names.js'
 
 /** 一个最小可用的假宿主 ctx：只实现本插件真会用到的那几个服务。 */
 function fakeCtx(overrides = {}) {
@@ -152,6 +153,43 @@ test('runHandoff 建会话、带种子、并投递交接文档', async () => {
   }
 })
 
+test('runHandoff 建会话后把新会话 attach 进 workspace（否则侧栏项目区不显示）', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'bridge-attach-'))
+  const attached = []
+  try {
+    const agents = {
+      async create(options) {
+        return { agent: { id: options.sessionId } }
+      },
+      get: () => undefined,
+    }
+    const workspace = {
+      path: dir,
+      async attachSession(sessionId) {
+        attached.push(sessionId)
+      },
+    }
+    const registry = {
+      list: () => [workspace],
+    }
+    const ctx = fakeCtx({
+      projectRoot: dir,
+      services: { agents, workingDirectory: { get: () => dir }, workspaceRegistry: registry },
+    })
+    const result = await runHandoff(ctx, {
+      sourceSessionId: 'session-src',
+      agent: { session: { id: 'session-src' } },
+      config: { todoLimit: 12, recentTurns: 3 },
+      randomUUID: () => 'attached-id',
+    })
+    assert.equal(result.ok, true)
+    assert.equal(result.sessionId, 'session-attached-id')
+    assert.deepEqual(attached, ['session-attached-id'], '新会话应被 attach 进 workspace')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test('runHandoff 源会话有总线名时继承名字', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'bridge-name-'))
   try {
@@ -173,11 +211,6 @@ test('runHandoff 源会话有总线名时继承名字', async () => {
           get: () => ({ followup() {} }),
         },
         workingDirectory: { get: () => dir },
-        dshSessionSend: {
-          async registerName(input) {
-            registered.push(input)
-          },
-        },
       },
     })
     const result = await runHandoff(ctx, {
@@ -188,9 +221,10 @@ test('runHandoff 源会话有总线名时继承名字', async () => {
     })
     assert.equal(result.ok, true)
     assert.equal(result.name, '管线维护-handoff')
-    assert.equal(registered.length, 1)
-    assert.equal(registered[0].name, '管线维护-handoff')
-    assert.equal(registered[0].sessionId, 'session-n1')
+    // 新会话应被真实写进 .dsh-bus/names.json（走总线 dsh_bus_register 同款写盘）
+    const finalNames = await readNames(dir)
+    assert.equal(finalNames['session-src'].name, '管线维护', '源会话登记仍在')
+    assert.equal(finalNames['session-n1'].name, '管线维护-handoff', '新会话已接续总线注册')
   } finally {
     await rm(dir, { recursive: true, force: true })
   }

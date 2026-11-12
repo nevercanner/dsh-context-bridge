@@ -96,13 +96,6 @@ async function main() {
           },
         }
       }
-      if (name === 'dshSessionSend') {
-        return {
-          async registerName(input) {
-            logs.push(['info', `registerName ${input.name}`])
-          },
-        }
-      }
       return undefined
     },
     on(event, listener) {
