@@ -47,9 +47,9 @@ function get(ctx, key) {
 /** 正在交接的会话，防重复点击。 */
 const inFlight = new Set()
 
-async function projectRootOf(ctx, agent) {
+async function projectRootOf(ctx, agent, sessionId) {
   if (agent !== undefined) {
-    const fromAgent = resolveProjectRoot(ctx, agent)
+    const fromAgent = await resolveProjectRoot(ctx, agent, sessionId)
     if (fromAgent !== undefined) return fromAgent
   }
   // 会话不在本进程激活时（只给了 id），退到宿主 cwd 服务；仍取不到就返回 undefined。
@@ -76,7 +76,7 @@ async function manualHandoff(ctx, logger, { sessionId, projectRoot }) {
   try {
     const agents = get(ctx, 'agents')
     const agent = typeof agents?.get === 'function' ? agents.get(sessionId) : undefined
-    const root = projectRoot ?? (await projectRootOf(ctx, agent))
+    const root = projectRoot ?? (await projectRootOf(ctx, agent, sessionId))
     if (root === undefined) {
       return { ok: false, detail: '无法确定该会话所属项目，交接已取消（没有创建任何东西）' }
     }
@@ -152,10 +152,10 @@ function routesFor(ctx, logger) {
         if (projectRoot === '') {
           const agents = get(ctx, 'agents')
           const agent = sessionId === '' ? undefined : agents?.get?.(sessionId)
-          projectRoot = (agent === undefined ? undefined : await projectRootOf(ctx, agent)) ?? ''
+          projectRoot = (await projectRootOf(ctx, agent, sessionId)) ?? ''
         }
         if (projectRoot === '') {
-          const fallback = await projectRootOf(ctx, undefined)
+          const fallback = await projectRootOf(ctx, undefined, sessionId)
           if (fallback !== undefined) projectRoot = fallback
         }
         if (projectRoot === '') return sendJson(res, 200, { enabled: false, status: '无法确定项目根', sessionId })

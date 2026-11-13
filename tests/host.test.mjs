@@ -263,3 +263,50 @@ test('runHandoff agents.create 抛错时返回失败而不是崩', async () => {
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+test('runHandoff: agent 未激活 + workingDirectory 拿不到时，从会话持久化 header.cwd 兜底解析项目根', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'bridge-persist-cwd-'))
+  const created = []
+  try {
+    const agents = {
+      async create(options) {
+        created.push(options)
+        return { agent: { id: options.sessionId } }
+      },
+      // agent 未激活：get 永远返回 undefined —— 这正是「后台/历史会话交接失败」的场景
+      get: () => undefined,
+    }
+    const ctx = fakeCtx({
+      services: {
+        agents,
+        // workingDirectory 拿不到（返回 undefined），逼出会话持久化兜底
+        workingDirectory: { get: () => undefined },
+        sessionQuery: {
+          async observeSession(sessionId) {
+            const observation = {
+              header: { cwd: dir },
+              events: [
+                { type: 'user/message', data: { turn: 1, message: { role: 'user', content: [{ type: 'text', text: '修复交接' }] } } },
+              ],
+            }
+            observation[Symbol.dispose] = () => {}
+            return observation
+          },
+        },
+      },
+    })
+    const result = await runHandoff(ctx, {
+      sourceSessionId: 'session-bg',
+      agent: undefined,
+      config: { todoLimit: 12, recentTurns: 3 },
+      randomUUID: () => 'bg1',
+    })
+    assert.equal(result.ok, true, `应能兜底解析项目根并完成交接，实际：${result.detail}`)
+    assert.equal(created.length, 1, '应创建新会话')
+    assert.equal(created[0].meta.parentSession, 'session-bg')
+    assert.equal(created[0].meta.cwd, dir, '新会话 meta.cwd 应来自会话持久化 header.cwd')
+    assert.equal(result.sessionId, 'session-bg1')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})

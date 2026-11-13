@@ -50,18 +50,35 @@ export function makeHandoffEvent({ text, seq = SESSION_SEQ_BASE, time = Date.now
   }
 }
 
-/** 读一个会话的完整事件（只读）。宿主没有 sessionQuery 时返回 undefined。 */
-export async function readEvents(ctx, sessionId) {
+/**
+ * 读一个会话的观察（只读）：返回 { events, header }。
+ * header 携带项目根（observation.header.cwd）——宿主 api-session-controller 就
+ * 是用它拿不回当前激活 agent 的会话 cwd（lib/index.js: 若
+ * observation.header.cwd === void 0 判定为会话不存在）。
+ * 宿主没有 sessionQuery 时返回 undefined。
+ */
+export async function readSessionObservation(ctx, sessionId) {
   const query = resolve(ctx, 'sessionQuery')
   if (query === undefined || typeof query.observeSession !== 'function') return undefined
   const observation = await query.observeSession(sessionId)
   if (observation === undefined || observation === null) return undefined
   try {
-    return Array.isArray(observation.events) ? observation.events : undefined
+    const header =
+      observation && typeof observation === 'object' && 'header' in observation ? observation.header : undefined
+    return {
+      events: Array.isArray(observation.events) ? observation.events : undefined,
+      header: header && typeof header === 'object' ? header : undefined,
+    }
   } finally {
     // observation 是租约，用完必须释放；没有 dispose 就跳过（只读观察不持有资源）
     if (typeof observation[Symbol.dispose] === 'function') observation[Symbol.dispose]()
   }
+}
+
+/** 读一个会话的完整事件（只读）。宿主没有 sessionQuery 时返回 undefined。 */
+export async function readEvents(ctx, sessionId) {
+  const observation = await readSessionObservation(ctx, sessionId)
+  return observation === undefined ? undefined : observation.events
 }
 
 function resolve(ctx, name) {
@@ -169,8 +186,10 @@ export function resolveAgentOptions(ctx, agent) {
   return undefined
 }
 
-/** 解析当前会话所属项目根：优先 workingDirectory，再退 agent.session.header.cwd。 */
-export function resolveProjectRoot(ctx, agent) {
+/** 解析当前会话所属项目根：优先 workingDirectory，再退 agent.session.header.cwd，
+ *  最后退会话持久化的 header.cwd（sessionQuery.observeSession —— 与宿主
+ *  api-session-controller 同源，后台/非激活会话也能取到）。 */
+export async function resolveProjectRoot(ctx, agent, sessionId) {
   try {
     const workingDirectory = resolve(ctx, 'workingDirectory')
     if (typeof workingDirectory?.get === 'function') {
@@ -186,6 +205,17 @@ export function resolveProjectRoot(ctx, agent) {
   }
   const cwd = agent?.session?.header?.cwd
   if (typeof cwd === 'string' && cwd.trim() !== '') return cwd
+  // 会话不在本进程激活时（agent 拿不到或没有 header.cwd），从会话持久化数据兜底：
+  // sessionQuery.observeSession 返回的 header.cwd 与激活 session.header.cwd 同源。
+  if (typeof sessionId === 'string' && sessionId.trim() !== '') {
+    try {
+      const observation = await readSessionObservation(ctx, sessionId)
+      const persistedCwd = observation?.header?.cwd
+      if (typeof persistedCwd === 'string' && persistedCwd.trim() !== '') return persistedCwd
+    } catch {
+      // 兜底失败就算了，返回 undefined 由上层提示「无法确定项目」
+    }
+  }
   return undefined
 }
 
@@ -275,7 +305,7 @@ export async function registerBaseName(ctx, { projectRoot, sessionId, name }) {
  */
 export async function runHandoff(ctx, input) {
   const { sourceSessionId, agent, config = {}, randomUUID } = input
-  const projectRoot = input.projectRoot ?? resolveProjectRoot(ctx, agent)
+  const projectRoot = input.projectRoot ?? (await resolveProjectRoot(ctx, agent, sourceSessionId))
   if (projectRoot === undefined) {
     return { ok: false, detail: '无法确定源会话所属项目，交接中止' }
   }
