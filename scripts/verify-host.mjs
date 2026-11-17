@@ -160,7 +160,8 @@ async function main() {
   check('ok=true', body2.ok === true, body2.detail)
   check('建了 1 个会话', created.length === 1)
   check('会话 id 有 session- 前缀', String(body2.sessionId).startsWith('session-'))
-  check('种子是交接文档', String(created[0]?.seed?.[0]?.data?.content?.[0]?.text ?? '').includes('交接文档'))
+  check('不带 seed（surface 首家必须留给 system/message）', created[0]?.seed === undefined,
+    `实际 seed=${JSON.stringify(created[0]?.seed)?.slice(0, 120)}`)
   check('投递了 1 条消息', pushed.length === 1)
 
   console.log('5) 路由拒绝错误方法')

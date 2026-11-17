@@ -9,45 +9,25 @@
  * 流程：
  *   1. 读源会话的事件（sessionQuery.observeSession，只读，不激活）
  *   2. 用 handoff.js 的纯函数拼出交接文档
- *   3. 用宿主自己的 user/message 形状做种子（session 只要求 id/role/source/content）
- *   4. `agents.create({ sessionId, seed, inheritedEventCount, meta })` 建新会话
- *   5. （可选）给新会话起一个继承自总线的名字
- *   6. 把交接文档作为**第一轮用户消息**推进去，唤醒它继续干活
+ *   3. `agents.create({ sessionId, meta })` 建一个**空**会话（不带 seed，见下）
+ *   4. （可选）给新会话起一个继承自总线的名字
+ *   5. 把交接文档作为**第一轮用户消息**推进去（followup → 宿主写 user/message），唤醒它继续干活
+ *
+ * 为什么 seed 里不能放 user/message（v0.1.4 修）：
+ *   宿主 v4 日志要求 surface 的**首个**节点必须是 `system/message`（受保护头），
+ *   dsh-session-format-v3-to-v4 `foldSurface`：surface 非空且没有受保护头时再来一条
+ *   `system/message` 就抛 SessionFormatError。把交接文档当 seed 写进 seq 0，等于让
+ *   user/message 占了 surface 头，于是这条会话**第一次跑模型就把日志写成读不回来的形状**，
+ *   下次打开报 `system/message requires a protected first surface head`。
+ *   合规做法只有一条：交接文档交给 followup，宿主会把它排在第一轮 system/message 之后。
  */
 
 import { readNames, nameIndex, nameOf, pickInheritedName, writeName } from './bus-names.js'
 import { buildHandoff, digestSummary, latestCompactionSummary, recentTurns, todosFromEvents } from './handoff.js'
 
-const SESSION_SEQ_BASE = 0
-
 /** 生成一个 session id（与宿主同款前缀，避免 UI 认不出）。 */
 export function makeSessionId(randomUUID) {
   return `session-${randomUUID()}`
-}
-
-/**
- * 构造一条最小的 `user/message` 事件。
- * 宿主的校验只要：id 非空、role "user"、source.kind 非空、content 是数组。
- */
-export function makeHandoffEvent({ text, seq = SESSION_SEQ_BASE, time = Date.now(), name }) {
-  const id = `handoff-${time.toString(36)}-${Math.random().toString(36).slice(2, 10)}`
-  return {
-    type: 'user/message',
-    seq,
-    time,
-    data: {
-      id,
-      role: 'user',
-      content: [{ type: 'text', text }],
-      source: {
-        kind: 'user',
-        origin: 'dsh-context-bridge',
-        from: 'dsh-context-bridge',
-        ...(typeof name === 'string' && name !== '' ? { fromName: name } : {}),
-      },
-    },
-    surfaceOp: 'append',
-  }
 }
 
 /**
@@ -323,20 +303,19 @@ export async function runHandoff(ctx, input) {
     return { ok: false, detail: '宿主未提供 agents.create，无法新建会话' }
   }
 
-  // 会话文件同步落盘（宿主的 seed 走的是 append，持久化在 create 内部完成）；
+  // 会话文件同步落盘（持久化在 create 内部完成）；
   // 这里再套一层 try，任何宿主侧异常都转成可读的失败结果，不让插件把宿主事件链带崩。
   // 新会话必须自带模型路由，否则第一轮开跑就报 has no provider/model（详见 resolveAgentOptions）。
   const route = resolveAgentOptions(ctx, agent)
   const id = makeSessionId(randomUUID ?? (() => globalThis.crypto?.randomUUID?.() ?? `${Date.now().toString(36)}`))
-  const event = makeHandoffEvent({ text, name: facts.busName })
   const cwd = facts.projectRoot
   try {
+    // 不带 seed：seed 里的 user/message 会占据 surface 首家（见文件头说明），
+    // 建出来的会话第一次跑模型就变成读不回来的日志。交接文档一律走下面的 followup。
     await agents.create({
       sessionId: id,
       ...(route === undefined ? {} : { agentOptions: route }),
-      seed: [event],
-      inheritedEventCount: 1,
-      meta: { cwd, parentSession: sourceSessionId, isSeeded: true },
+      meta: { cwd, parentSession: sourceSessionId },
     })
   } catch (error) {
     return { ok: false, detail: `新建会话失败：${String(error)}` }

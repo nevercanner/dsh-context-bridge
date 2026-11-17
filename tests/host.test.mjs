@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { makeHandoffEvent, makeSessionId, runHandoff, seedAndWake } from '../src/handoff-host.js'
+import { makeSessionId, runHandoff, seedAndWake } from '../src/handoff-host.js'
 import { readNames } from '../src/bus-names.js'
 
 /** 一个最小可用的假宿主 ctx：只实现本插件真会用到的那几个服务。 */
@@ -52,16 +52,44 @@ test('makeSessionId 带 session- 前缀', () => {
   assert.equal(makeSessionId(() => 'abc'), 'session-abc')
 })
 
-test('makeHandoffEvent 满足宿主 user/message 校验', () => {
-  const event = makeHandoffEvent({ text: '交接正文', name: '管线维护' })
-  assert.equal(event.type, 'user/message')
-  assert.equal(event.seq, 0)
-  assert.equal(event.data.role, 'user')
-  assert.ok(typeof event.data.id === 'string' && event.data.id !== '')
-  assert.ok(Array.isArray(event.data.content))
-  assert.equal(event.data.content[0].text, '交接正文')
-  assert.ok(typeof event.data.source.kind === 'string' && event.data.source.kind !== '')
-  assert.equal(event.data.source.fromName, '管线维护')
+// 回归：agents.create 绝不能带 surface 事件当种子。
+// 宿主 v4 要求 surface 首家是 system/message；seed 里塞 user/message 会让新会话
+// 第一次跑模型就写出「读不回来」的日志（system/message requires a protected first
+// surface head），下次打开直接报会话损坏。
+const SURFACE_TYPES = ['system/message', 'user/message', 'developer/message', 'assistant/message', 'tool/result']
+
+test('runHandoff 建会话时 seed 里不放任何 surface 事件', async () => {
+  const created = []
+  const realCtx = fakeCtx({ services: { agents: {
+    async create(options) {
+      created.push(options)
+      return { agent: { id: options.sessionId } }
+    },
+    get: () => undefined,
+  } } })
+  const result = await runHandoff(realCtx, {
+    sourceSessionId: 'session-src',
+    projectRoot: 'D:\openclaw-data\demo',
+    randomUUID: () => 'new',
+    config: {},
+  })
+  assert.equal(created.length, 1, '应当恰好建一个新会话')
+  const options = created[0]
+  const seed = options.seed
+  if (Array.isArray(seed)) {
+    for (const event of seed) {
+      assert.ok(
+        !SURFACE_TYPES.includes(event && event.type),
+        `seed 里不许出现 surface 事件，实际出现 ${String(event && event.type)}`,
+      )
+    }
+  } else {
+    assert.equal(seed, undefined, '不带 seed 最好')
+  }
+  assert.ok(!('inheritedEventCount' in options) || options.inheritedEventCount === 0,
+    '没有继承事件时 inheritedEventCount 必须是 0')
+  assert.notEqual(options.meta && options.meta.isSeeded, true, '空会话不是 seeded 会话')
+  assert.equal(result.ok, true)
 })
 
 test('seedAndWake 目标不存在时返回 ok:false 而不是抛', async () => {
@@ -110,7 +138,7 @@ test('seedAndWake 没有 followup 时退回 send 并唤醒', async () => {
   assert.deepEqual(calls, [['user', 'next-turn', true]])
 })
 
-test('runHandoff 建会话、带种子、并投递交接文档', async () => {
+test('runHandoff 建空会话并投递交接文档', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'bridge-run-'))
   const pushed = []
   const created = []
@@ -142,9 +170,9 @@ test('runHandoff 建会话、带种子、并投递交接文档', async () => {
     assert.equal(created.length, 1, '应创建恰好一个新会话')
     const made = created[0]
     assert.equal(made.sessionId, 'session-fixed')
-    assert.equal(made.inheritedEventCount, 1)
+    assert.equal(made.seed, undefined, '不带 seed')
     assert.equal(made.meta.parentSession, 'session-src')
-    assert.ok(made.seed[0].data.content[0].text.includes('交接文档'))
+    assert.notEqual(made.meta.isSeeded, true, '空会话不是 seeded 会话')
     assert.equal(result.ok, true)
     assert.equal(result.sessionId, 'session-fixed')
     assert.equal(pushed.length, 1, '交接文档应被投递给新会话')

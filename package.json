@@ -1,6 +1,6 @@
 {
   "name": "dsh-context-bridge",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Automatic handoff for DSH sessions: build a compact handoff document from project facts, context summary and todos, then create and wake a new session with it.",
   "type": "module",
   "main": "src/index.js",
@@ -16,14 +16,38 @@
     "type": "git",
     "url": "git+https://github.com/nevercanner/dsh-context-bridge.git"
   },
-  "keywords": ["dsh", "dsh-plugin", "session", "context", "handoff", "compaction", "agent"],
-  "files": ["src", "types", "assets", "tests", "cordis.patch.yml", "README.md", "README.zh.md", "LICENSE"],
-  "engines": { "node": ">=22.18.0" },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "session",
+    "context",
+    "handoff",
+    "compaction",
+    "agent"
+  ],
+  "files": [
+    "src",
+    "types",
+    "assets",
+    "tests",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.18.0"
+  },
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web",
-      "inject": ["@deepseek-ai/dsh-client-ui-sidebar", "@deepseek-ai/dsh-client-ui-workspace"]
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-workspace"
+      ]
     }
   },
   "scripts": {
