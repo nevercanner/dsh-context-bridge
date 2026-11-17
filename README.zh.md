@@ -71,6 +71,27 @@ DSH 会话**手动**交接。当你判断一个会话的上下文确实用不下
 - `agents.create` 是宿主 API；不提供的宿主上，插件会说明原因，不会假装成功。
 - 新会话继承的是 cwd 和 `parentSession` 指向，不是完整父历史。
 
+## 会话日志修复工具
+
+`scripts/` 里另有两个独立的日志修复脚本（纯 Python + `zstandard`，不依赖宿主），
+用来修「已经写坏、打开就报 corrupt」的 `session.v4.jsonl.zstd`：
+
+| 脚本 | 修的病灶 | 宿主报错 |
+|---|---|---|
+| `fix-surface-head.py` | `user/message` 占了 surface 首家，system 之后才到 | `system/message requires a protected first surface head` |
+| `fix-step-coords.py` | 同一 turn 里 `step/start` 的编号重复/跳号 | `step/start does not match the open turn and next step` |
+
+用法都一样：先不加参数干跑看它打算改哪几段，确认后加 `--apply` 落盘（自动备份
+`session.v4.jsonl.zstd.bak-*`）。两个脚本都只改结构坐标，不动任何消息内容。
+
+```bash
+python scripts/fix-step-coords.py "C:/Users/<你>/.dsh/sessions/<项目>/<会话>" --apply
+```
+
+修复后如何自证：用宿主自己的校验器跑一遍（`@deepseek-ai/dsh-session` 的
+`adoptSessionEvent`、`@deepseek-ai/dsh-session-format-v3-to-v4` 的
+`restoreReleasedV4Artifact`、`Session.fromRestore`），三关全过再重开会话。
+
 ## 许可
 
 MIT
