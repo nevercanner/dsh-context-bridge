@@ -52,6 +52,77 @@ export function sentences(text) {
  *   +1 带路径或反引号（可定位）
  *   -2 超过 200 字（长句子通常在复述日志）
  */
+/**
+ * 把「只差相同结论」的一批行压成一条。
+ *
+ * 真实场景（探针里一目了然）：连续 3 轮都是「改一个模块 → 跑 npm test →
+ * 91 pass」，于是「已经做到哪」出现三行
+ *   module 10 补完，npm test 91 pass
+ *   module 11 补完，npm test 91 pass
+ *   module 12 补完，npm test 91 pass
+ * 结论其实是同一个（测试全绿）。逐字去重抓不到（前缀不同），于是按三元组
+ * 取「谓语」判重：命中 OUTCOME 且去掉主语后相同 → 合并成
+ * `module 10 补完 等 3 项，npm test 91 pass`。
+ *
+ * 只在候选项上合并，不动 pickLines 的通用语义（它对被传入的行没有这个假设）。
+ *
+ * @param {Array<{text:string,count?:number,turn?:number}>} candidates
+ * @returns {Array<{text:string,count?:number,turn?:number}>}
+ */
+export function mergeRepeats(candidates) {
+  const list = Array.isArray(candidates) ? candidates : []
+  /** 谓语 → { heads: string[], slots: object[], tail: string } */
+  const groups = new Map()
+  const order = []
+  const passthrough = []
+  for (const item of list) {
+    const text = squash(typeof item === 'string' ? item : item?.text)
+    if (text === '') continue
+    const slot = { text, count: item?.count, turn: item?.turn }
+    if (!OUTCOME.test(text)) {
+      passthrough.push(slot)
+      continue
+    }
+    // 用「末句」当谓语：`module 10 补完，npm test 91 pass` → `npm test 91 pass`
+    const parts = text.split(/[，,；;]/).map((piece) => piece.trim()).filter((piece) => piece !== '')
+    const tail = parts.length > 1 ? parts.slice(-1)[0] : ''
+    const head = parts.length > 1 ? parts.slice(0, -1).join('，') : text
+    if (tail === '' || head === '') {
+      passthrough.push(slot)
+      continue
+    }
+    const key = tail.toLowerCase().replace(/[。.!?！？\s]/g, '')
+    if (!groups.has(key)) {
+      groups.set(key, { tail, heads: [], slots: [] })
+      order.push(key)
+    }
+    const group = groups.get(key)
+    group.heads.push(head)
+    group.slots.push(slot)
+  }
+  const merged = []
+  for (const key of order) {
+    const group = groups.get(key)
+    if (group.slots.length === 1) {
+      merged.push(group.slots[0])
+      continue
+    }
+    // 用 head（去掉尾句的部分）拼，不能拿整行拼 —— 整行里已经带了尾句，
+    // 拼完会出现「登录页改完，构建成功、设置页改完，构建成功，构建成功」。
+    const heads = group.heads
+    const label =
+      heads.length > 2
+        ? `${heads[0]} 等 ${heads.length} 项`
+        : `${heads[0]}、${heads[heads.length - 1]}`
+    merged.push({
+      text: `${label}，${group.tail}`,
+      count: group.slots.length + 1,
+      turn: group.slots[group.slots.length - 1].turn,
+    })
+  }
+  return [...merged, ...passthrough]
+}
+
 export function pickLines(candidates, { maxLines = BULLET_MAX, budget = 900 } = {}) {
   const scored = []
   const seen = new Set()
@@ -136,7 +207,7 @@ export function localDigest(input) {
         }]
       : []),
   ]
-  const bullets = pickLines(outcomeCandidates, { maxLines: BULLET_MAX, budget: 700 })
+  const bullets = pickLines(mergeRepeats(outcomeCandidates), { maxLines: BULLET_MAX, budget: 700 })
   if (bullets.length === 0 && trail !== undefined && trail.total > 0) {
     bullets.push(`源会话共 ${trail.total} 次工具调用（最近 ${trail.items.length} 条见「注意事项」）`)
   }

@@ -55,6 +55,13 @@ function get(ctx, key) {
 /** 正在交接的会话，防重复点击。 */
 const inFlight = new Set()
 
+/**
+ * 自动交接执行器的引用。apply 时赋值，routesFor 里的 status 读它把
+ * 「为什么没交接」暴露到侧栏。用 ref 而不是闭包变量，是因为 routesFor
+ * 是在 ctx.inject 回调里构造的，早于 auto 的创建。
+ */
+const autoRef = { current: undefined }
+
 async function projectRootOf(ctx, agent, sessionId) {
   if (agent !== undefined) {
     const fromAgent = await resolveProjectRoot(ctx, agent, sessionId)
@@ -198,6 +205,9 @@ function routesFor(ctx, logger) {
           rounds,
           busName: busName ?? null,
           namesPath: namesPathFor(projectRoot),
+          // 为什么这一轮没交接：把 skip 原因直接摆在侧栏，省得用户去翻宿主日志。
+          // auto 由 apply 里的 ctx.effect 注入（读 status 时可能还没初始化，所以判空）。
+          lastSkip: autoRef.current?.lastSkip?.get(sessionId) ?? null,
           sessionId,
         })
       },
@@ -277,6 +287,7 @@ export function apply(ctx, rawConfig = {}) {
 
   // 自动交接：唯一一个事件监听，只认 session/event 的 turn/end
   const auto = createAutoHandoff({ ctx, logger, inFlight, randomUUID })
+  autoRef.current = auto
   try {
     const dispose = auto.listen()
     if (typeof dispose === 'function') disposers.push(dispose)
@@ -293,6 +304,8 @@ export function apply(ctx, rawConfig = {}) {
       }
     }
     auto.lastAttempt.clear()
+    auto.lastSkip.clear()
+    autoRef.current = undefined
     inFlight.clear()
   }, 'dsh-context-bridge: lifetime')
 

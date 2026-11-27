@@ -103,21 +103,38 @@ async function roundsFor(ctx, { sessionId, session }) {
 export function createAutoHandoff({ ctx, logger, inFlight, randomUUID }) {
   /** sessionId → 已经尝试过交接的轮次 */
   const lastAttempt = new Map()
+  /** 最近一次跳过交接的原因（诊断用；侧栏 status 会读它） */
+  const lastSkip = new Map()
+
+  function skip(sessionId, reason, extra) {
+    // rounds 提到顶层：侧栏/测试都按 skip.rounds 读，塞在 extra 里等于没暴露
+    const rounds = extra !== null && typeof extra === 'object' && Number.isFinite(extra.rounds) ? extra.rounds : undefined
+    lastSkip.set(sessionId, { reason, at: Date.now(), rounds })
+    logger?.debug?.(`[dsh-context-bridge] skip handoff for ${sessionId}: ${reason}`)
+    return undefined
+  }
 
   async function check(session) {
     const sessionId = typeof session?.id === 'string' ? session.id : ''
     if (sessionId === '') return undefined
-    if (inFlight !== undefined && inFlight.has(sessionId)) return undefined
+    if (inFlight !== undefined && inFlight.has(sessionId)) return skip(sessionId, 'already in flight')
     try {
-      const agent = resolve(ctx, 'agents')?.get?.(sessionId)
+      const agents = resolve(ctx, 'agents')
+      const agent = typeof agents?.get === 'function' ? agents.get(sessionId) : undefined
+      // agent 缺失不等于不能交接：readSessionSnapshot/sessionQuery 都能按 id 读日志。
+      // 但**必须**记下来——否则用户看到「20 多轮没交接」时无从判断是这里的锅。
       const projectRoot = await projectRootFor(ctx, { sessionId, agent, session })
-      if (projectRoot === undefined) return undefined
+      if (projectRoot === undefined) return skip(sessionId, 'no project root (cwd / session header / agent 都取不到)')
       // 每次重读：配置改了下一轮就按新值走（无需重启）
       const config = await readProjectConfig(projectRoot)
+      if (config.enabled !== true) return skip(sessionId, `disabled by ${projectRoot}/.dsh-bridge.json`)
+      if (config.autoHandoff !== true) return skip(sessionId, 'autoHandoff=false')
       const rounds = await roundsFor(ctx, { sessionId, session })
-      if (rounds <= 0) return undefined
-      if (!shouldAutoHandoff({ config, rounds })) return undefined
-      if (lastAttempt.get(sessionId) === rounds) return undefined
+      if (rounds <= 0) return skip(sessionId, 'rounds=0（日志里既没有 turn/start 也没有带 turn 的 user/message）', { rounds })
+      if (!shouldAutoHandoff({ config, rounds })) {
+        return skip(sessionId, `rounds ${rounds} < threshold ${config.handoffRounds}`, { rounds })
+      }
+      if (lastAttempt.get(sessionId) === rounds) return skip(sessionId, `round ${rounds} already attempted`, { rounds })
       lastAttempt.set(sessionId, rounds)
       logger?.info?.(triggerMessage(rounds, config.handoffRounds, sessionId))
       if (inFlight !== undefined) inFlight.add(sessionId)
@@ -131,12 +148,14 @@ export function createAutoHandoff({ ctx, logger, inFlight, randomUUID }) {
         })
         if (result.ok) {
           lastAttempt.delete(sessionId)
+          lastSkip.delete(sessionId)
           logger?.info?.(
             `[dsh-context-bridge] auto handoff done: ${sessionId} -> ${result.sessionId}` +
               (result.name === undefined ? '' : `（总线名「${result.name}」）`) +
               `；归档 ${result.archiveFile}`,
           )
         } else {
+          lastSkip.set(sessionId, { reason: `handoff aborted: ${result.detail}`, at: Date.now(), rounds })
           logger?.warn?.(`[dsh-context-bridge] auto handoff aborted: ${result.detail}`)
         }
         return result
@@ -144,6 +163,7 @@ export function createAutoHandoff({ ctx, logger, inFlight, randomUUID }) {
         if (inFlight !== undefined) inFlight.delete(sessionId)
       }
     } catch (error) {
+      lastSkip.set(sessionId, { reason: `error: ${String(error)}`, at: Date.now() })
       logger?.warn?.(`[dsh-context-bridge] auto handoff error: ${String(error)}`)
       return undefined
     }
@@ -163,5 +183,5 @@ export function createAutoHandoff({ ctx, logger, inFlight, randomUUID }) {
     return typeof dispose === 'function' ? dispose : () => {}
   }
 
-  return { check, onSessionEvent, listen, lastAttempt }
+  return { check, onSessionEvent, listen, lastAttempt, lastSkip }
 }

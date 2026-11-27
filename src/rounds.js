@@ -54,6 +54,13 @@ export function countTurns(events) {
  * 每次判断都用**刚刚读到的配置**（调用方不缓存），所以用户在会话中途改
  * `.dsh-bridge.json` 的 handoffRounds，下一轮就按新值判断，不需要重启。
  *
+ * 语义是「**过了阈值就一直该交**」，不是「只在等于阈值那一轮交一次」。
+ * 这条曾经写错过：早期实现把某次失败记进 lastAttempt 后，同一个会话在
+ * 阈值轮之后每一轮都因为 `rounds !== 记录值` 而重新尝试，看起来像「每轮都试、
+ * 但每轮都失败」；反过来一旦把「已尝试」当成终态，转轮次继续涨就再也不会
+ * 触发第二次。正确做法是：判定只看 rounds >= threshold，防重试交给
+ * auto-handoff 的「同一轮只尝试一次 + 失败后指数退避」。
+ *
  * @param {object} input
  * @param {object} [input.config] 项目配置（readProjectConfig 的结果）
  * @param {number} input.rounds 当前轮次
@@ -65,5 +72,8 @@ export function shouldAutoHandoff({ config, rounds }) {
   if (config.autoHandoff !== true) return false
   const threshold = Number(config.handoffRounds)
   if (!Number.isFinite(threshold) || threshold <= 0) return false
-  return Number(rounds) >= threshold
+  const current = Number(rounds)
+  // NaN / 负数一律视为「还早」，而不是交给 >= 的隐式转换去误判
+  if (!Number.isFinite(current) || current <= 0) return false
+  return current >= threshold
 }

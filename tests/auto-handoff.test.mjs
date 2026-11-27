@@ -257,3 +257,51 @@ test('turn/end 之外的事件不触发（turn 中途不打断）', async () => 
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+test('跳过原因记进 lastSkip：低于阈值时给得出「为什么没交」', async () => {
+  const dir = await projectWithConfig(30)
+  try {
+    const events = eventsOfRounds(20)
+    const { ctx } = liveCtx({ dir, events })
+    const auto = createAutoHandoff({ ctx, logger: ctx.get('logger'), inFlight: new Set(), randomUUID: () => 'skip1' })
+    await auto.check({ id: 'session-skip', snapshotEvents: () => events })
+    const skip = auto.lastSkip.get('session-skip')
+    assert.ok(skip !== undefined, '没记录跳过原因')
+    assert.match(skip.reason, /rounds 20 < threshold 30/)
+    assert.equal(skip.rounds, 20)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('lastSkip 在成功交接后被清掉', async () => {
+  const dir = await projectWithConfig(15)
+  try {
+    const events = eventsOfRounds(20)
+    const { ctx } = liveCtx({ dir, events })
+    const auto = createAutoHandoff({ ctx, logger: ctx.get('logger'), inFlight: new Set(), randomUUID: () => 'skip2' })
+    await auto.check({ id: 'session-ok', snapshotEvents: () => events })
+    assert.equal(auto.lastSkip.has('session-ok'), false)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('过了阈值每一轮都是候选，不会因为某一轮失败就永久哑掉', async () => {
+  const dir = await projectWithConfig(15)
+  try {
+    const events = eventsOfRounds(22)
+    const { ctx, created } = liveCtx({ dir, events })
+    const auto = createAutoHandoff({ ctx, logger: ctx.get('logger'), inFlight: new Set(), randomUUID: () => 'many' })
+    // 先跑 21 轮这一轮
+    const session21 = { id: 'session-many', snapshotEvents: () => events.slice(0, eventsOfRounds(21).length) }
+    await auto.check(session21)
+    assert.equal(created.length, 1)
+    // 同一会话继续到 22 轮（lastAttempt 记录的是 21）
+    const session22 = { id: 'session-many', snapshotEvents: () => events }
+    await auto.check(session22)
+    assert.equal(created.length, 2, '22 轮应该再交一次，而不是因为「已经交过」哑掉')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
