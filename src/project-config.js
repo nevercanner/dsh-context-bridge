@@ -34,6 +34,18 @@ const DEFAULTS = {
   handoffRounds: 15,
   /** 旧上下文归档目录（相对项目根）。 */
   archiveDir: '.dsh-archive',
+  /**
+   * 交接文档的字数预算（默认 3000）。超出时先砍「最近几轮」整节，再硬截断。
+   * 文档是路线图不是会话副本 —— 细节全在归档文件里。
+   */
+  docBudget: 3000,
+  /**
+   * 摘要生成方式：
+   *   · `local`（默认）：纯本地规则压缩，零网络零延迟，交接永远不因摘要失败。
+   *   · `llm`：额外调一次模型把事件压成「一句话 + 做到哪 + 下一步」。
+   *     有 timeoutMs 上限，超时/报错静默回落 local。
+   */
+  summarizer: { mode: 'local', timeoutMs: 12000 },
 }
 
 export function normalizeRoot(value) {
@@ -65,6 +77,15 @@ function pickPath(value) {
   return raw
 }
 
+/** 摘要配置：只认 local/llm，超时夹在 2s~60s 之间（更短等于必然超时，更长会挂住事件链）。 */
+function pickSummarizer(value) {
+  const source = value !== null && typeof value === 'object' && !Array.isArray(value) ? value : {}
+  return {
+    mode: source.mode === 'llm' ? 'llm' : 'local',
+    timeoutMs: pickNumber(source.timeoutMs, DEFAULTS.summarizer.timeoutMs, 2000, 60000),
+  }
+}
+
 /** 把磁盘上的原始配置规范化；坏文件一律按默认（开启）处理，绝不因为配置错就让插件抛。 */
 export function normalizeConfig(raw) {
   const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
@@ -79,6 +100,9 @@ export function normalizeConfig(raw) {
     // 1~500 轮之间夹紧：0 或负数会让「每轮都交接」，那等于把会话撕碎。
     handoffRounds: pickNumber(source.handoffRounds, DEFAULTS.handoffRounds, 1, 500),
     archiveDir: pickPath(source.archiveDir),
+    // 400 字以下文档承载不了任何有效信息，30000 字以上等于没压缩。
+    docBudget: pickNumber(source.docBudget, DEFAULTS.docBudget, 400, 30000),
+    summarizer: pickSummarizer(source.summarizer),
   }
 }
 

@@ -77,7 +77,7 @@ test('recentTurns 只保留最后 N 轮', () => {
   assert.deepEqual(turns.map((t) => t.turn), [5, 6])
 })
 
-test('buildHandoff 产出包含三个关键小节', () => {
+test('buildHandoff 产出包含关键小节且摘要排在事实之前', () => {
   const text = buildHandoff({
     projectRoot: 'D:\\openclaw-data\\demo',
     title: '修登录',
@@ -86,11 +86,15 @@ test('buildHandoff 产出包含三个关键小节', () => {
     todos: todosFromEvents(events),
     summaryLines: digestSummary(latestCompactionSummary(events)),
     recent: recentTurns(events, 3),
-    todoLimit: 12,
+    currentEvents: events,
+    todoLimit: 8,
   })
   assert.ok(text.includes('# 交接文档：demo'))
-  assert.ok(text.includes('## 现在要做什么'))
+  // 新的骨架：一句话主线在最前，事实/要求在后（新会话读第一屏就该知道在干嘛）
+  assert.ok(text.includes('## 一句话'))
   assert.ok(text.includes('## 下一步'))
+  assert.ok(text.includes('## 关键事实'))
+  assert.ok(text.indexOf('## 一句话') < text.indexOf('## 关键事实'))
   assert.ok(text.includes('补 token 过期测试'))
   assert.ok(!text.includes('[进行中] 改 auth 中间件'))
   assert.ok(text.includes('管线维护'))
@@ -98,8 +102,9 @@ test('buildHandoff 产出包含三个关键小节', () => {
 
 test('buildHandoff 空输入也能产出可用骨架', () => {
   const text = buildHandoff({ projectRoot: '', todos: [], summaryLines: [], recent: [] })
-  assert.ok(text.includes('## 现在要做什么'))
-  assert.ok(text.includes('## 项目事实'))
+  assert.ok(text.includes('## 一句话'))
+  assert.ok(text.includes('## 下一步'))
+  assert.ok(text.includes('## 注意事项'))
 })
 
 // ── 真实事件形状回归 ────────────────────────────────────────────────
@@ -152,18 +157,23 @@ test('toolTrail 统计调用次数并挑出能说明动作的参数', () => {
   assert.equal(trail.items[1].hint, '跑测试')
 })
 
-test('buildHandoff 在待办为空时用最后一条用户要求填「现在要做什么」', () => {
+test('buildHandoff 在待办为空时用最后一条用户要求当「下一步」', () => {
   const text = buildHandoff({
     projectRoot: 'D:\proj',
     todos: [],
     recent: recentTurns(realEvents, 3),
     requests: userRequests(realEvents, { limit: 3 }),
     toolTrail: toolTrail(realEvents),
+    currentEvents: realEvents,
   })
-  assert.ok(text.includes('- 用户最后的要求：补上 token 过期测试'))
+  // 待办为空 → 下一步退化成「按最后一条要求继续」，不出现「没有明确当前任务」
+  assert.ok(text.includes('按「补上 token 过期测试'))
   assert.ok(text.includes('## 用户最近的原始要求'))
   assert.ok(text.includes('ops_bash「跑测试」'))
   assert.ok(!text.includes('（源会话没有留下明确的当前任务'))
+  // 关键事实从原始事件里提取：改过的文件与跑过的命令
+  assert.ok(text.includes('## 关键事实'))
+  assert.ok(text.includes('src/auth.js') || text.includes('npm test'))
 })
 
 test('buildHandoff 把归档路径写进文档头（否则新会话看不到归档）', () => {

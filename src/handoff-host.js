@@ -32,6 +32,9 @@ import {
   toolTrail,
   userRequests,
 } from './handoff.js'
+import { localDigest, promptMaterial } from './digest.js'
+import { salientFacts } from './salient.js'
+import { modelDigest } from './summarizer.js'
 import { countTurns } from './rounds.js'
 import { writeContextArchive } from './archive.js'
 import { resolve } from './ctx-services.js'
@@ -251,24 +254,45 @@ export function sessionTitleOf(ctx, agent) {
   return undefined
 }
 
-/** 组装交接文档所需的事实。 */
+/**
+ * 组装交接文档所需的事实。
+ *
+ * 这里多做一步**本地摘要**（digest.localDigest）：把待办、压缩摘要、关键事实、
+ * 最近几轮压成「一句话主线 / 做到哪 / 下一步 / 注意事项」四块。
+ * 之所以默认走本地规则而不是模型：交接发生在宿主 turn/end 的同步事件链里，
+ * 现场插一次网络请求会把整条事件链挂住；模型摘要只在 `summarizer.mode: "llm"`
+ * 时由 runHandoff 额外补一层（见那里的说明）。
+ *
+ * `events` 同时作为 `currentEvents` 透传下去：buildHandoff 需要它算归档里的
+ * 事件定位锚点（events[#N]），以及在没有 facts 时自己补一次提取。
+ */
 export async function collectHandoffInput(ctx, { sessionId, agent, projectRoot, recentTurnCount = 3 }) {
   const events = (await readEvents(ctx, sessionId)) ?? []
   const names = projectRoot === undefined ? {} : await readNames(projectRoot)
+  const todos = todosFromEvents(events)
+  const summaryLines = digestSummary(latestCompactionSummary(events))
+  const recent = recentTurns(events, recentTurnCount)
+  const requests = userRequests(events, { limit: 3 })
+  // 下面两项是「文档不空」的保险：待办（tool-todo）和摘要（compaction）
+  // 在本机默认都没启用，只有原始要求与工具轨迹一定存在。
+  const trail = toolTrail(events)
+  const facts = salientFacts(events)
   return {
     projectRoot: projectRoot ?? '',
     title: sessionTitleOf(ctx, agent) ?? '',
     sourceSessionId: sessionId,
     busName: nameOf(names, sessionId) ?? '',
-    todos: todosFromEvents(events),
-    summaryLines: digestSummary(latestCompactionSummary(events)),
-    recent: recentTurns(events, recentTurnCount),
-    // 下面三项是「文档不空」的保险：待办（tool-todo）和摘要（compaction）
-    // 在本机默认都没启用，只有原始要求与工具轨迹一定存在。
-    requests: userRequests(events, { limit: 3 }),
-    toolTrail: toolTrail(events),
+    todos,
+    summaryLines,
+    recent,
+    requests,
+    toolTrail: trail,
     turnCount: countTurns(events),
     eventCount: events.length,
+    // ↓ 新增：压缩后的关键事实 + 本地摘要 + 原始事件（给 buildHandoff 算锚点用）
+    facts,
+    digest: localDigest({ title: sessionTitleOf(ctx, agent) ?? '', requests, todos, summaryLines, facts, recent }),
+    currentEvents: events,
   }
 }
 
@@ -430,9 +454,57 @@ export async function runHandoff(ctx, input) {
 
   // 文档必须带着归档路径一起生成：没有这句，归档文件对新会话就是不可见的
   // （它只看得到 followup 投进来的这一段文字）。所以 buildHandoff 排在归档之后。
+  //
+  // 模型摘要（可选，summarizer.mode === 'llm'）：
+  //   本地规则摘要只能做「挑句子」，不理解任务意图；模型能把 100+ 条事件压成
+  //   一句话主线 + 3 条「做到哪」。代价是一次 LLM 往返，所以：
+  //     · 默认关闭（mode: 'local'）；
+  //     · 显式开启时也**有超时上限**（summarizer.timeoutMs，默认 12s），
+  //       超时/报错一律静默回落到本地摘要 —— 交接不允许因为模型慢而失败；
+  //     · 模型结果只覆盖 headline/bullets/next/guard 四块，
+  //       「关键事实」「原始要求」永远来自原始事件，模型编不出来。
+  //   为什么不在 collectHandoffInput 里做：那里在 archive 之前，
+  //   模型慢会推迟归档（唯一的不可逆步骤），失败面更大。
+  let digest = facts.digest
+  let digestSource = digest === undefined ? 'none' : digest.source
+  if (config.summarizer !== undefined && config.summarizer.mode === 'llm') {
+    const material = promptMaterial({
+      title: facts.title,
+      requests: facts.requests,
+      todos: facts.todos,
+      summaryLines: facts.summaryLines,
+      facts: facts.facts,
+      recent: facts.recent,
+    })
+    const fromModel = await modelDigest(ctx, {
+      route: resolveAgentOptions(ctx, agent),
+      material,
+      timeoutMs: config.summarizer.timeoutMs,
+      logger: ctx?.logger,
+    })
+    if (fromModel !== undefined) {
+      // 合并而不是替换：模型没给出来的块（比如 next 为空）沿用本地摘要，
+      // 保证「下一步」这一节不会因为模型偷懒而消失。
+      digest = {
+        headline: fromModel.headline !== '' ? fromModel.headline : digest?.headline,
+        bullets: fromModel.bullets.length > 0 ? fromModel.bullets : (digest?.bullets ?? []),
+        next: fromModel.next.length > 0 ? fromModel.next : (digest?.next ?? []),
+        guard: fromModel.guard.length > 0 ? fromModel.guard : (digest?.guard ?? []),
+        source: 'llm',
+      }
+      digestSource = 'llm'
+    } else {
+      digestSource = `${digestSource}（模型摘要失败，已回落）`
+    }
+  }
+
   const text = buildHandoff({
     ...facts,
-    todoLimit: config.todoLimit ?? 12,
+    digest,
+    todoLimit: config.todoLimit ?? 8,
+    // 字数预算：交接文档是「路线图」，不是会话副本。默认 3000 字，
+    // 超出部分全部留在归档里（归档是完整事件流）。
+    budget: config.docBudget ?? config.budget,
     archivePath: archive.file,
     eventCount: archive.eventCount,
   })
@@ -498,6 +570,7 @@ export async function runHandoff(ctx, input) {
       registered.detail,
       hidden.detail,
       `旧上下文已归档：${archive.file}（${archive.bytes} 字节，${archive.eventCount} 条事件）`,
+      `交接文档：${text.length} 字，摘要来源 ${digestSource}`,
       route === undefined
         ? '⚠ 没有解析到模型路由：新会话需要先在界面里选一个模型再发消息，否则宿主会报 has no provider/model'
         : `模型：${route.provider}/${route.model}`,

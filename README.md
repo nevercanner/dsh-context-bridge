@@ -141,8 +141,10 @@ count (otherwise every session would register a name the user never chose).
   "autoHandoff": true,
   "handoffRounds": 15,
   "archiveDir": ".dsh-archive",
-  "todoLimit": 12,
+  "todoLimit": 8,
   "recentTurns": 3,
+  "docBudget": 3000,
+  "summarizer": { "mode": "local", "timeoutMs": 12000 },
   "openNewSession": true
 }
 ```
@@ -153,8 +155,10 @@ count (otherwise every session would register a name the user never chose).
 | `autoHandoff` | `true` | `false` keeps manual triggering only |
 | `handoffRounds` | `15` | hand off at this round (1–500); **re-read before every decision, so a change applies on the next turn** |
 | `archiveDir` | `.dsh-archive` | archive directory, relative to the project root or absolute |
-| `todoLimit` | `12` | todos listed in the document |
+| `todoLimit` | `8` | todos listed in the document |
 | `recentTurns` | `3` | turns summarised into the document |
+| `docBudget` | `3000` | body character budget (400–30000); when exceeded the "recent turns" section is dropped first, then the text is hard-truncated |
+| `summarizer` | `{mode:"local"}` | `local` = deterministic rule-based compression; `llm` = one extra model call to phrase the digest, bounded by `timeoutMs` and silently falling back to `local` on timeout/error |
 | `openNewSession` | `true` | navigate the UI to the new session after it is created |
 
 No restart is needed after a config change: the file is re-read before every
