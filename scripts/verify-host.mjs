@@ -1,13 +1,15 @@
 /**
  * 用「假宿主」把插件的 host 半真跑一遍 —— 不用启动 DSH 就能验证：
- *   1. apply() 不抛、能挂上 agent/turn-stopping 与 effect 清理
+ *   1. apply() 不抛、只挂一个 session/event 监听 + 生命周期清理
  *   2. 注册的两条 HTTP 路由真的能用（status / run）
- *   3. 低于阈值不触发，高于阈值触发一次，且在冷却窗口内不重复
+ *   3. 手动 /run 能建会话、投递文档
+ *   4. 会话跑到 15 轮（turn/end）时自动交接：日志有 handoff triggered at round 15、
+ *      归档文件落盘、新会话建出来、旧会话被归档
  *
  * 用法：node scripts/verify-host.mjs
  * 退出码 0 = 全通过；非 0 = 有断言失败（CI 友好）。
  */
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, writeFile, rm, readdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { apply } from '../src/index.js'
@@ -118,7 +120,8 @@ async function main() {
   } catch (error) {
     check('apply 未抛异常', false, String(error))
   }
-  check('没有注册任何事件监听（纯手动，不自动触发）', listeners.size === 0, `实际 ${listeners.size}: ${[...listeners.keys()].join(',')}`)
+  check('只注册了 1 个事件监听，且是 session/event', listeners.size === 1 && listeners.has('session/event'),
+    `实际 ${listeners.size}: ${[...listeners.keys()].join(',')}`)
   check('注册了 2 条路由', routes.size === 2, `实际 ${routes.size}`)
   check('注册了生命周期清理', disposers.length === 1)
 
@@ -134,6 +137,10 @@ async function main() {
   check('HTTP 200', res1.statusCode === 200, `实际 ${res1.statusCode}`)
   check('enabled=true（默认开）', body1.enabled === true, String(body1.enabled))
   check('状态说明是默认开启', String(body1.status).includes('默认'), body1.status)
+  check('mode 是 auto+manual', body1.mode === 'auto+manual', String(body1.mode))
+  check('handoffRounds 默认 15', body1.handoffRounds === 15, String(body1.handoffRounds))
+  check('archiveDirPath 指向 <项目>/.dsh-archive',
+    String(body1.archiveDirPath).replace(/\\/g, '/').endsWith('/.dsh-archive'), String(body1.archiveDirPath))
   check('projectRoot 指向临时目录', String(body1.projectRoot).replace(/\\/g, '/').startsWith(dir.replace(/\\/g, '/')), body1.projectRoot)
 
   console.log('3) 项目显式关掉时手动 /run 被拒，且不建任何东西')
@@ -164,12 +171,45 @@ async function main() {
     `实际 seed=${JSON.stringify(created[0]?.seed)?.slice(0, 120)}`)
   check('投递了 1 条消息', pushed.length === 1)
 
-  console.log('5) 路由拒绝错误方法')
+  console.log('5) 自动交接：跑到第 15 轮的 turn/end 就强制交接（不手动点）')
+  const autoEvents = []
+  for (let turn = 1; turn <= 15; turn += 1) {
+    autoEvents.push({ type: 'turn/start', data: { turn } })
+    autoEvents.push({
+      type: 'user/message',
+      data: { turn, message: { role: 'user', content: [{ type: 'text', text: `第 ${turn} 轮` }] } },
+    })
+    autoEvents.push({
+      type: 'assistant/message',
+      data: { turn, message: { role: 'assistant', content: [{ type: 'text', text: '收到' }] } },
+    })
+    autoEvents.push({ type: 'turn/end', data: { turn, reason: { kind: 'completed' } } })
+  }
+  const autoSession = { id: 'session-auto', snapshotEvents: () => autoEvents }
+  listeners.get('session/event')(autoSession, { type: 'turn/end', data: { turn: 15 } })
+  await new Promise((resolve) => setTimeout(resolve, 200))
+  check('日志里有 handoff triggered at round 15',
+    logs.some(([level, line]) => level === 'info' && String(line).includes('handoff triggered at round 15')),
+    JSON.stringify(logs.slice(-4)))
+  check('自动交接建了第 2 个会话', created.length === 2, `实际 ${created.length}`)
+  check('新会话的父会话是 session-auto', created[1]?.meta?.parentSession === 'session-auto',
+    JSON.stringify(created[1]?.meta))
+  let archiveFiles = []
+  try {
+    archiveFiles = await readdir(join(dir, '.dsh-archive'))
+  } catch {
+    archiveFiles = []
+  }
+  const autoArchives = archiveFiles.filter((name) => String(name).startsWith('session-auto-'))
+  check('归档目录生成了本次交接的 JSON', autoArchives.length === 1, `实际 ${JSON.stringify(archiveFiles)}`)
+  check('归档文件名带源会话 id', autoArchives.length === 1, String(archiveFiles[0]))
+
+  console.log('6) 路由拒绝错误方法')
   const res3 = fakeRes()
   await statusRoute.handler(fakeReq({ method: 'POST', url: '/plugins/dsh-context-bridge/status' }), res3)
   check('POST status → 405', res3.statusCode === 405, String(res3.statusCode))
 
-  console.log('6) 清理函数可调用且不抛')
+  console.log('7) 清理函数可调用且不抛')
   try {
     for (const dispose of disposers) dispose()
     check('dispose 未抛', true)

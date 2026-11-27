@@ -248,10 +248,15 @@ window.__ModuleLoader__.load({
       }, [busy, reload, sessionId])
 
       const body = state.body
+      const threshold = body?.handoffRounds ?? 15
+      const autoOn = body?.autoHandoff !== false
+      const rounds = typeof body?.rounds === 'number' ? `${body.rounds} / ${threshold}` : `— / ${threshold}`
       const rows = [
         ['项目', body?.projectName ?? '—'],
         ['开关', body?.status ?? (state.loading ? '读取中…' : '—')],
-        ['触发', '手动（点按钮才执行）'],
+        ['触发', autoOn ? `自动：${threshold} 轮一轮（也可手动）` : '手动（点按钮才执行）'],
+        ['轮次', rounds],
+        ['归档', body?.archiveDirPath ?? '—'],
         ['总线名', body?.busName ?? '（未注册）'],
       ]
 
@@ -261,7 +266,7 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { style: { fontSize: 13, opacity: 0.7 } },
-          '把当前会话压成交接文档，开一个新会话继续。不会自动触发 —— 上下文快满时先压缩，压不动了再点这里。',
+          `会话跑到 ${threshold} 轮（turn/end）时自动交接：旧上下文完整归档、新会话接续、并用侧边栏里的会话名注册到总线。也可以在这里立刻交接。`,
         ),
         state.error !== ''
           ? h('div', { style: { color: '#d66', fontSize: 13 } }, state.error)
@@ -300,7 +305,7 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { style: { fontSize: 12, opacity: 0.5, lineHeight: 1.7 } },
-          '开启方式：在项目根建 .dsh-bridge.json，写 {"enabled": true}。默认关闭，不写文件就完全不工作。',
+          '配置：项目根 .dsh-bridge.json —— {"enabled": true, "handoffRounds": 15, "archiveDir": ".dsh-archive"}。改阈值下一轮就生效，不用重启；归档写盘失败时交接中止，原会话继续跑。',
         ),
       )
     }

@@ -1,31 +1,39 @@
 /**
- * host 半 —— 纯手动交接。
+ * host 半 —— 自动 + 手动交接。
  *
- * 这里**没有**任何自动触发：不监听任何 agent 生命周期事件，不看 token 用量，
- * 没有阈值、没有冷却、没有定时器。交接只在你点菜单里的那一行时发生。
+ * v0.2.0 起有两条触发路径：
+ *   · **自动**：监听 `session/event`，会话跑到 `handoffRounds` 轮（默认 15）的
+ *     `turn/end` 上强制交接一次（见 auto-handoff.js）。阈值每次判断前重读
+ *     `.dsh-bridge.json`，中途改值下一轮就生效，不用重启。
+ *   · **手动**：会话行菜单 / 面板按钮 → HTTP /run（人的即时判断，永远保留）。
  *
- * 为什么这样设计：上下文快满时，第一件事应该是压缩（`/compact` 或自动压缩），
- * 压缩多轮后仍然压不动，交接才是最后一步 —— 这个判断只有人能做，
- * 一个阈值猜不出来，猜错的结果是「还能压一压的会话被提前抛弃」。
+ * 交接的动作固定为五步：归档旧上下文 → 建新会话 → 登记总线（侧边栏手动名，
+ * 没有则回退 UUID）→ 投递交接文档 → 把旧会话从活跃列表归档。
+ * 归档写盘失败时整体中止，不建会话、不登记总线，原会话继续跑。
  *
- * 设计约束（来自 2026-11-09 的真实事故）：
+ * 设计约束（来自 2026-11-09 的真实事故，仍然有效）：
  *   1. **不注册任何 DOM 兜底**。dsh-session-send 曾用 DOM 变更观察器扫描
  *      所有 role="menu"，再把自建节点塞进 React 管理的容器 —— React 下一次
  *      渲染抹掉它，观察器再插一次，打开模型菜单就把渲染进程主线程锁死。
  *   2. Client 半只用官方 slot，改动需整机重启才生效（运行中改会 rev 失配）。
  *   3. 宿主服务一律 ctx.get() + try 兜底读取，不做静态 import，
  *      也绝不裸读 ctx.xxx（未声明 inject 时会抛）。
+ *   4. 监听只挂在 `session/event` 上，且只在 `turn/end` 之后动作 —— 不在
+ *      turn 中途打断，不动宿主的 LLM 流。
  */
 
-import { describeConfig, normalizeRoot, readProjectConfig } from './project-config.js'
+import { CONFIG_DEFAULTS, describeConfig, normalizeRoot, readProjectConfig } from './project-config.js'
 import { runHandoff, resolveProjectRoot } from './handoff-host.js'
 import { readNames, nameOf, namesPathFor } from './bus-names.js'
+import { createAutoHandoff } from './auto-handoff.js'
+import { archiveDirFor } from './archive.js'
+import { countTurns } from './rounds.js'
 import { randomUUID } from 'node:crypto'
 
 export const name = 'dsh-context-bridge'
 export const description =
-  '会话交接（手动）：在你点「上下文交接」的那一刻，把项目事实、上下文摘要与待办压成一份交接文档，' +
-  '新建会话并把文档作为第一轮投入，让它接着干；新会话可继承会话总线的注册名。不按阈值自动触发。'
+  '会话交接：会话跑到 15 轮（可配）自动强制交接 —— 旧上下文完整归档、新会话接续、' +
+  '并用侧边栏手动名注册到会话总线；也可在会话行菜单里手动触发。'
 
 /** 不需要任何必需服务；其余全部 ctx.get 兜底。 */
 export const inject = []
@@ -162,14 +170,32 @@ function routesFor(ctx, logger) {
         const config = await readProjectConfig(projectRoot)
         const names = await readNames(projectRoot)
         const busName = sessionId === '' ? undefined : nameOf(names, sessionId)
+        // 当前轮次：读活会话的内存快照；读不到就给 null（界面显示「—」，别拿假的 0 骗人）
+        let rounds = null
+        if (sessionId !== '') {
+          try {
+            const liveAgent = get(ctx, 'agents')?.get?.(sessionId)
+            const snapshot =
+              typeof liveAgent?.session?.snapshotEvents === 'function' ? liveAgent.session.snapshotEvents() : undefined
+            const counted = countTurns(Array.isArray(snapshot) ? snapshot : [])
+            if (counted > 0) rounds = counted
+          } catch {
+            // 状态面板不该因为这个 500
+          }
+        }
         return sendJson(res, 200, {
           enabled: config.enabled === true,
           status: describeConfig(config),
-          mode: 'manual',
+          mode: config.autoHandoff === true ? 'auto+manual' : 'manual',
           projectRoot,
           projectName: projectRoot.split(/[\\/]/).filter(Boolean).pop() ?? '',
           todoLimit: config.todoLimit,
           recentTurns: config.recentTurns,
+          autoHandoff: config.autoHandoff === true,
+          handoffRounds: config.handoffRounds,
+          archiveDir: config.archiveDir,
+          archiveDirPath: archiveDirFor(projectRoot, config.archiveDir),
+          rounds,
           busName: busName ?? null,
           namesPath: namesPathFor(projectRoot),
           sessionId,
@@ -249,6 +275,15 @@ export function apply(ctx, rawConfig = {}) {
     logger?.warn?.(`[dsh-context-bridge] webServer 注入失败：${String(error)}`)
   }
 
+  // 自动交接：唯一一个事件监听，只认 session/event 的 turn/end
+  const auto = createAutoHandoff({ ctx, logger, inFlight, randomUUID })
+  try {
+    const dispose = auto.listen()
+    if (typeof dispose === 'function') disposers.push(dispose)
+  } catch (error) {
+    logger?.warn?.(`[dsh-context-bridge] 自动交接监听注册失败：${String(error)}`)
+  }
+
   ctx.effect?.(() => () => {
     for (const dispose of disposers.splice(0)) {
       try {
@@ -257,8 +292,11 @@ export function apply(ctx, rawConfig = {}) {
         // 忽略卸载异常
       }
     }
+    auto.lastAttempt.clear()
     inFlight.clear()
   }, 'dsh-context-bridge: lifetime')
 
-  logger?.info?.('[dsh-context-bridge] 已装载（手动触发：不注册任何自动监听）')
+  logger?.info?.(
+    `[dsh-context-bridge] 已装载（自动交接阈值 ${CONFIG_DEFAULTS.handoffRounds} 轮，以 .dsh-bridge.json 的 handoffRounds 为准；手动触发保留）`,
+  )
 }

@@ -22,8 +22,11 @@
  *   合规做法只有一条：交接文档交给 followup，宿主会把它排在第一轮 system/message 之后。
  */
 
-import { readNames, nameIndex, nameOf, pickInheritedName, writeName } from './bus-names.js'
+import { readNames, nameIndex, nameOf, pickFreeName, writeName } from './bus-names.js'
 import { buildHandoff, digestSummary, latestCompactionSummary, recentTurns, todosFromEvents } from './handoff.js'
+import { writeContextArchive } from './archive.js'
+import { resolve } from './ctx-services.js'
+import { readManualSessionName, titleTextOf } from './session-name.js'
 
 /** 生成一个 session id（与宿主同款前缀，避免 UI 认不出）。 */
 export function makeSessionId(randomUUID) {
@@ -61,17 +64,37 @@ export async function readEvents(ctx, sessionId) {
   return observation === undefined ? undefined : observation.events
 }
 
-function resolve(ctx, name) {
-  try {
-    const viaGet = typeof ctx?.get === 'function' ? ctx.get(name) : undefined
-    if (viaGet !== undefined) return viaGet
-  } catch {
-    // ctx.get 在个别宿主上会抛，继续走属性兜底
+/**
+ * 读一个会话的**完整快照**（归档用）：{ header, inheritedEventCount, events }。
+ *
+ * 为什么优先 `sessionQuery.readSession`：
+ *   它返回宿主落盘/内存里的完整原始事件流（含 system/message 系统提示、
+ *   user/assistant 历史、tool/result 调用记录），也正是 shell 里 `dsh session`
+ *   类工具读的那份 —— 归档要「完整」，就不能拿 observeSession 的增量视图凑。
+ *   `readSession` 不存在（老宿主 / 测试桩）时退 observeSession，拿到的照样是
+ *   原始事件，只是没有 inheritedEventCount。
+ */
+export async function readSessionSnapshot(ctx, sessionId) {
+  const query = resolve(ctx, 'sessionQuery')
+  if (query !== undefined && typeof query.readSession === 'function') {
+    try {
+      const read = await query.readSession(sessionId)
+      if (read !== undefined && read !== null && typeof read === 'object') {
+        return {
+          header: read.session !== null && typeof read.session === 'object' ? read.session : undefined,
+          inheritedEventCount: typeof read.inheritedEventCount === 'number' ? read.inheritedEventCount : 0,
+          events: Array.isArray(read.events) ? read.events : [],
+        }
+      }
+    } catch {
+      // 日志坏/会话不存在 → 退到只读观察，至少留下能留的部分
+    }
   }
-  try {
-    return ctx?.[name]
-  } catch {
-    return undefined
+  const observation = await readSessionObservation(ctx, sessionId)
+  return {
+    header: observation?.header,
+    inheritedEventCount: 0,
+    events: observation?.events ?? [],
   }
 }
 
@@ -199,13 +222,20 @@ export async function resolveProjectRoot(ctx, agent, sessionId) {
   return undefined
 }
 
-/** 源会话标题（有就带进交接文档，便于溯源）。 */
+/**
+ * 源会话标题（有就带进交接文档，便于溯源）。
+ *
+ * v0.2.0 修：这里以前调 `sessionTitle.current(session)` —— 宿主的 SessionTitleService
+ * 根本没有 `current` 方法（它只有 get / rename / refresh），所以标题**永远是
+ * undefined**，交接文档里那一行一直是空的。现在走 `get(session)`，返回值可能是
+ * 字符串，也可能是 `{ title, source }` 快照（两种都吃）。
+ */
 export function sessionTitleOf(ctx, agent) {
   try {
     const titles = resolve(ctx, 'sessionTitle')
-    const value = typeof titles?.current === 'function' ? titles.current(agent.session) : undefined
-    if (typeof value === 'string') return value
-    if (value !== null && typeof value === 'object' && typeof value.title === 'string') return value.title
+    const session = agent?.session
+    if (session === undefined || typeof titles?.get !== 'function') return undefined
+    return titleTextOf(titles.get(session))
   } catch {
     // 没有标题服务就算了
   }
@@ -252,36 +282,102 @@ export async function seedAndWake(ctx, { sessionId, text, name }) {
 }
 
 /**
- * 把新会话登记进项目名册。
+ * 把新会话登记进项目名册（会话总线）。
  *
  * 走的是与总线 dsh_bus_register 工具同一份写入（registry/names.js 的
  * writeName：写 `<project>/.dsh-bus/names.json`，原子 tmp+rename）。
- * 之前从这里 resolve('dshSessionSend').registerName —— 但总线插件从不暴露
- * 那个服务/方法（它只把 dsh_bus_register 注册成模型工具，底层就是写文件），
- * 所以那条链路永远是断的。现在直接读/写同一份名册，总线和交接互相可见。
+ *
+ * 命名规则（验收要求）：
+ *   1. 源会话在侧边栏被**手动命名**过 → 新会话直接用**这个名字本身**注册：
+ *      先把源会话的登记摘掉（名称转移，避免同名双 owner 让 `dsh_bus_send` 歧义），
+ *      再登记给新会话；
+ *   2. 没有手动名字 → 回退成**新会话自己的 id（UUID）**，注册照常；
+ *   3. 手动名字已被**别的**会话占用（用户给两个会话起了同名）→ 退让成 `<名>-2`，
+ *      绝不覆盖别人的登记。
+ *
+ * @returns {Promise<{ok:boolean, name?:string, detail:string}>}
  */
-export async function registerBaseName(ctx, { projectRoot, sessionId, name }) {
+export async function registerBusName({ projectRoot, oldSessionId, newSessionId, manualName }) {
+  const manual = typeof manualName === 'string' ? manualName.trim() : ''
   try {
-    await writeName(projectRoot, sessionId, name)
-    return { ok: true, detail: `已在会话总线登记名「${name}」` }
+    let names = await readNames(projectRoot)
+    const oldName = nameOf(names, oldSessionId)
+    if (manual !== '' && oldName !== undefined && oldName === manual) {
+      // 名称转移：先摘掉旧会话，让这个名字空出来（否则 pickFreeName 会加 -2）
+      names = await writeName(projectRoot, oldSessionId, '')
+    }
+    const name = pickFreeName({
+      index: nameIndex(names),
+      base: manual !== '' ? manual : newSessionId,
+      sessionId: newSessionId,
+    })
+    if (name === '') throw new Error('无法为新会话生成注册名')
+    await writeName(projectRoot, newSessionId, name)
+    return {
+      ok: true,
+      name,
+      detail: manual !== ''
+        ? `已在会话总线用侧边栏名「${name}」登记新会话`
+        : `侧边栏未手动命名，已在会话总线用会话 id「${name}」登记`,
+    }
   } catch (error) {
     return { ok: false, detail: `总线登记失败：${String(error)}` }
   }
 }
 
 /**
- * 执行一次交接：建会话 → 起名 → 推文档。
+ * 把旧会话从活跃列表里摘掉（宿主侧「归档」= 隐藏，不是删文件）。
  *
- * 只由「人点了按钮」那条路径调用（HTTP /run），没有别的调用者。
+ * 宿主 `workspaceRegistry.archiveSession(id)`：写入 archivedSessionIds，
+ * 侧栏所有分组表面都不再列出它（侧栏「全部会话 — 显示已归档」里还能找回）。
+ * 会话还有活（正在跑一轮）时它会抛 WorkspaceActiveSessionError —— 交接本来
+ * 就该让旧会话停下来，所以第二次带 `{ stopActivity: true }` 重试，由宿主
+ * 通知各 provider（agent 取消本轮、jobs 杀子进程）停掉它。
+ *
+ * 为什么要 archive 而不是只写归档文件：会话文件仍在磁盘、仍会被 resume，
+ * 光有 JSON 归档并不能让「旧会话不出现在活跃列表」成立。
+ */
+export async function archiveOldSession(ctx, sessionId) {
+  const registry = resolve(ctx, 'workspaceRegistry')
+  if (registry === undefined || typeof registry.archiveSession !== 'function') {
+    return { ok: false, detail: '宿主未提供 workspaceRegistry.archiveSession，旧会话未从活跃列表移除' }
+  }
+  try {
+    await registry.archiveSession(sessionId)
+    return { ok: true, detail: '旧会话已从活跃列表归档' }
+  } catch {
+    try {
+      await registry.archiveSession(sessionId, { stopActivity: true })
+      return { ok: true, detail: '旧会话已归档，并已通知各 provider 停止它的活动' }
+    } catch (error) {
+      return { ok: false, detail: `旧会话归档失败（归档文件仍在，可用它恢复）：${String(error)}` }
+    }
+  }
+}
+
+/**
+ * 执行一次交接：**归档旧上下文 → 建会话 → 登记总线 → 推文档 → 藏起旧会话**。
+ *
+ * 顺序为什么是这个顺序（每步的失败处理都由它决定）：
+ *   1. **归档先做**。归档是这次交接唯一的不可逆副作用里最便宜、最可验证的一步；
+ *      它失败（磁盘拒写、目录不可用、上下文不可序列化）就整体中止 ——
+ *      不建新会话、不登记总线、旧会话原样继续跑（验收要求 4）。
+ *   2. 归档成功后建新会话。建会话失败时归档文件保留（旧上下文没丢，可以人工恢复）。
+ *   3. 总线登记用**侧边栏手动名**，没有就回退新会话 id（UUID）。
+ *   4. 交接文档走 followup 投递（不能当 seed：surface 首家必须留给 system/message）。
+ *   5. 最后把旧会话从活跃列表归档（workspaceRegistry.archiveSession），
+ *      失败只记 detail，不回滚 —— 新会话已经带着交接文档跑起来了，
+ *      为了「侧栏少一行」把它回滚掉才是真正的数据损失。
  *
  * @param {object} ctx 宿主 context
  * @param {object} input
  * @param {string} input.sourceSessionId 源会话
- * @param {object} [input.agent] 源 agent（拿标题/项目根用）
+ * @param {object} [input.agent] 源 agent（拿标题/项目根/模型路由用）
  * @param {string} [input.projectRoot] 已解析好的项目根
  * @param {object} [input.config] 项目配置
  * @param {Function} [input.randomUUID] 便于测试注入
- * @returns {Promise<{ok:boolean, sessionId?:string, name?:string, text?:string, detail:string}>}
+ * @returns {Promise<{ok:boolean, sessionId?:string, name?:string, text?:string, detail:string,
+ *   aborted?:boolean, abortReason?:string, archiveFile?:string, archivedOldSession?:boolean}>}
  */
 export async function runHandoff(ctx, input) {
   const { sourceSessionId, agent, config = {}, randomUUID } = input
@@ -298,9 +394,29 @@ export async function runHandoff(ctx, input) {
   })
   const text = buildHandoff({ ...facts, todoLimit: config.todoLimit ?? 12 })
 
+  // ── 1) 归档旧上下文（失败 = 整体中止）──────────────────────────────
+  const snapshot = await readSessionSnapshot(ctx, sourceSessionId)
+  let archive
+  try {
+    archive = await writeContextArchive({
+      projectRoot,
+      archiveDir: config.archiveDir,
+      sessionId: sourceSessionId,
+      title: facts.title,
+      context: snapshot,
+    })
+  } catch (error) {
+    return {
+      ok: false,
+      aborted: true,
+      abortReason: 'archive',
+      detail: `旧上下文归档失败，交接已中止（未建新会话、未登记总线，原会话继续运行）：${String(error)}`,
+    }
+  }
+
   const agents = resolve(ctx, 'agents')
   if (agents === undefined || typeof agents.create !== 'function') {
-    return { ok: false, detail: '宿主未提供 agents.create，无法新建会话' }
+    return { ok: false, archiveFile: archive.file, detail: '宿主未提供 agents.create，无法新建会话（旧上下文已归档）' }
   }
 
   // 会话文件同步落盘（持久化在 create 内部完成）；
@@ -318,34 +434,47 @@ export async function runHandoff(ctx, input) {
       meta: { cwd, parentSession: sourceSessionId },
     })
   } catch (error) {
-    return { ok: false, detail: `新建会话失败：${String(error)}` }
+    return {
+      ok: false,
+      archiveFile: archive.file,
+      detail: `新建会话失败：${String(error)}（旧上下文已归档：${archive.file}）`,
+    }
   }
 
   // 新会话建好了，但宿主只在「走 session-controller 的常规创建路径」时才会把会话
   // attach 进 workspace（侧栏项目区据此显示）。我们走的是 agents.create，宿主不会
-  // 自动挂载，所以这里手动 attach —— 否则会话在磁盘上存在、也有内容，侧栏却找不到
-  //（feature 复现：交接成功但项目区看不到新会话）。
+  // 自动挂载，所以这里手动 attach —— 否则会话在磁盘上存在、也有内容，侧栏却找不到。
   await attachToWorkspace(ctx, id, projectRoot)
 
-  // 继承总线名（只在源会话本来就有名字时才继承）
-  let picked
-  let registerDetail = ''
-  if (facts.busName !== '') {
-    const names = await readNames(facts.projectRoot)
-    picked = pickInheritedName({ index: nameIndex(names), base: facts.busName, sessionId: id })
-    const registered = await registerBaseName(ctx, { projectRoot: facts.projectRoot, sessionId: id, name: picked })
-    registerDetail = registered.detail
-  }
+  // ── 2) 总线登记：侧边栏手动名（没有就回退 UUID）──────────────────────
+  const manualName = await readManualSessionName(ctx, { sessionId: sourceSessionId, agent })
+  const registered = await registerBusName({
+    projectRoot,
+    oldSessionId: sourceSessionId,
+    newSessionId: id,
+    manualName,
+  })
 
-  const seeded = await seedAndWake(ctx, { sessionId: id, text, name: picked ?? facts.busName })
+  // ── 3) 投递交接文档 ────────────────────────────────────────────────
+  const seeded = await seedAndWake(ctx, { sessionId: id, text, name: registered.name ?? manualName })
+
+  // ── 4) 旧会话不再出现在活跃列表 ────────────────────────────────────
+  const hidden = await archiveOldSession(ctx, sourceSessionId)
+
   return {
     ok: true,
     sessionId: id,
-    ...(picked === undefined ? {} : { name: picked }),
+    ...(registered.name === undefined ? {} : { name: registered.name }),
+    ...(manualName === undefined ? {} : { manualName }),
+    archiveFile: archive.file,
+    archiveBytes: archive.bytes,
+    archivedOldSession: hidden.ok,
     text,
     detail: [
       seeded.detail,
-      registerDetail,
+      registered.detail,
+      hidden.detail,
+      `旧上下文已归档：${archive.file}（${archive.bytes} 字节，${archive.eventCount} 条事件）`,
       route === undefined
         ? '⚠ 没有解析到模型路由：新会话需要先在界面里选一个模型再发消息，否则宿主会报 has no provider/model'
         : `模型：${route.provider}/${route.model}`,

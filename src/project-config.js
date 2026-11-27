@@ -1,12 +1,14 @@
 /**
  * 项目级配置 —— 与 dsh-session-send 同款：每个项目自己的 .dsh-bridge.json。
  *
- * **纯手动**：本插件没有任何按阈值自动触发。交接只在你于会话行菜单里点
- * 「上下文交接」时发生。原因：上下文快满时，第一件事应该是压缩；
- * 只有压缩多轮之后确实压不动了，交接才是最后一步 —— 那个判断只有人能做。
+ * 触发方式有两条，都在这里配：
+ *   · **自动**（v0.2.0 起）：会话跑到 `handoffRounds` 轮（默认 15）就强制交接一次，
+ *     交接完立刻把旧上下文归档、旧会话从活跃列表移除。
+ *   · **手动**：会话行菜单 / 面板按钮随时可以交接。
+ *   `autoHandoff: false` 可关掉自动那条，只留手动。
  *
- * 所以配置里不带任何自动触发参数：阈值、冷却、自动续接这类键在这里都不存在，
- * 因为手动模式下它们不该有。
+ * 「下一轮就生效」：这些值**每次判断前都重新读盘**（见 index.js 的
+ * installAutoHandoff），插件里没有任何缓存副本，所以会话中途改阈值不用重启。
  */
 
 import { existsSync, statSync } from 'node:fs'
@@ -18,18 +20,20 @@ export const CONFIG_FILE = '.dsh-bridge.json'
 const DEFAULTS = {
   /**
    * 默认开启：没有配置文件 = 可用。
-   *
-   * 为什么改成默认开：插件是手动触发的（人点菜单才执行），自动触发已经删掉了，
-   * 「没建文件就用不上」只会让新项目莫名其妙用不了。要关掉某个项目，
-   * 显式写 {"enabled": false} —— 开关保留，但默认放行。
    */
   enabled: true,
   /** 交接文档里最多列几条待办。 */
   todoLimit: 12,
   /** 最近几轮放进交接文档。 */
   recentTurns: 3,
-  /** 交接后是否自动把界面切到新会话（只是导航，不涉及任何后台触发）。 */
+  /** 交接后是否自动把界面切到新会话（只是导航，不涉及别的副作用）。 */
   openNewSession: true,
+  /** 自动交接：跑到 handoffRounds 轮就强制交接（默认开）。显式 false = 只留手动。 */
+  autoHandoff: true,
+  /** 自动交接阈值（轮）。默认 15 —— 用户要求的默认值；改它下一轮即生效，无需重启。 */
+  handoffRounds: 15,
+  /** 旧上下文归档目录（相对项目根）。 */
+  archiveDir: '.dsh-archive',
 }
 
 export function normalizeRoot(value) {
@@ -54,6 +58,13 @@ function pickNumber(value, fallback, min, max) {
   return rounded
 }
 
+/** 归档目录：只接受非空字符串；空/非法一律回默认。 */
+function pickPath(value) {
+  const raw = typeof value === 'string' ? value.trim().replace(/\\/g, '/').replace(/\/+$/, '') : ''
+  if (raw === '' || raw === '.') return DEFAULTS.archiveDir
+  return raw
+}
+
 /** 把磁盘上的原始配置规范化；坏文件一律按默认（开启）处理，绝不因为配置错就让插件抛。 */
 export function normalizeConfig(raw) {
   const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
@@ -63,6 +74,11 @@ export function normalizeConfig(raw) {
     todoLimit: pickNumber(source.todoLimit, DEFAULTS.todoLimit, 1, 50),
     recentTurns: pickNumber(source.recentTurns, DEFAULTS.recentTurns, 0, 10),
     openNewSession: source.openNewSession !== false,
+    // 自动交接默认开；显式 false 只留手动。
+    autoHandoff: source.autoHandoff !== false,
+    // 1~500 轮之间夹紧：0 或负数会让「每轮都交接」，那等于把会话撕碎。
+    handoffRounds: pickNumber(source.handoffRounds, DEFAULTS.handoffRounds, 1, 500),
+    archiveDir: pickPath(source.archiveDir),
   }
 }
 
@@ -81,9 +97,11 @@ export async function readProjectConfig(projectRoot) {
 
 export function describeConfig(config) {
   if (config.enabled !== true) return '已关闭（本项目写了 enabled: false）'
-  if (config.broken === true) return '配置文件无法解析，已按默认开启（手动触发）'
-  if (config.present === false) return '已开启（默认，无配置文件）'
-  return '已开启（手动触发）'
+  const rounds = Number(config.handoffRounds) > 0 ? Number(config.handoffRounds) : DEFAULTS.handoffRounds
+  const auto = config.autoHandoff === true ? `自动交接：${rounds} 轮` : '仅手动触发'
+  if (config.broken === true) return `配置文件无法解析，已按默认开启（${auto}）`
+  if (config.present === false) return `已开启（默认：${rounds} 轮自动交接）`
+  return `已开启（${auto}）`
 }
 
 export const CONFIG_DEFAULTS = DEFAULTS

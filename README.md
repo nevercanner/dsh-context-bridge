@@ -2,27 +2,61 @@
 
 # dsh-context-bridge
 
-**Manual** session handoff for DSH. When you decide a session has run out of
-usable context, click one menu row: the plugin writes a compact handoff
-document — current goal, what is done, what is next, project facts — creates a
-new session seeded with it, and wakes that session so work continues. The new
-session can inherit the session-bus name of the one it came from.
+**Automatic** session handoff for DSH. When a session reaches **15 turns**
+(`handoffRounds`, configurable), the plugin hands off on that turn's `turn/end`:
+the old session's **complete context** (system prompt, user/assistant history,
+tool results) is serialised into an archive JSON, a compact handoff document —
+current goal, what is done, what is next, project facts — is delivered to a new
+session, that session is registered on the session bus under **the name shown in
+the sidebar**, and the old session is archived out of the active list. Manual
+triggering (menu row / panel button) still works.
 
-It is **not** automatic. There is no threshold, no timer, no listener on the
-agent loop. This is deliberate: when context fills up the first move is to
-compact, and only after several rounds of compaction stop helping is a handoff
-the right last step. That judgement is yours, not a number's.
+**Why rounds and not tokens**: token counts swing wildly with tool output, so one
+threshold means very different amounts of work in two sessions; the turn number is
+a sequence the host maintains itself (`turn/start`), stable and reproducible, and
+the plugin needs no counter state of its own.
 
-Default **on**: no config file means the menu row works. To turn a project off,
-write `{"enabled": false}` in `<project>/.dsh-bridge.json`.
+**Live threshold**: the config is re-read before every decision, with no caching,
+so changing `handoffRounds` from 15 to 20 mid-session takes effect on the next
+turn — no restart.
+
+Default **on**: no config file means 15 rounds and `.dsh-archive`. To disable
+automatic handoff in a project write `{"autoHandoff": false}`; to disable the
+plugin entirely write `{"enabled": false}`.
 
 ---
 
-## How it is triggered
+## When it triggers
 
-One place only: the row **上下文交接：生成并续接** inside a session's `…` menu
-(or the **立即交接** button in the sidebar panel). Nothing else in the plugin can
-start a handoff.
+| Path | Trigger | Notes |
+|---|---|---|
+| Automatic | `turn/end` on `session/event`, current round ≥ `handoffRounds` | Only after a turn **finishes** — never mid-turn, which would swallow the reply to the message you just sent. The log shows `handoff triggered at round 15` |
+| Manual | **上下文交接：生成并续接** in the session `…` menu / **立即交接** in the panel | Human judgement still wins: click to hand off early |
+
+Each round is attempted **at most once** per session. If archiving fails the whole
+handoff aborts (no session, no bus registration, the old session keeps running)
+and the same disk error is not retried on every later turn.
+
+## What a handoff does
+
+1. **Archive the old context** (first, and fatal on failure):
+   `<project>/.dsh-archive/<session_id>-<timestamp>.json` with `session_id`,
+   `archive_time`, `context_snapshot` (every raw event: system prompt,
+   user/assistant history, tool results). Atomic tmp + rename, never a half JSON.
+2. **Create the new session**: `agents.create({ sessionId, agentOptions, meta: { cwd, parentSession } })`
+   with **no seed** (a `user/message` in the seed occupies the protected surface
+   head and writes an unreadable log).
+3. **Register on the bus** under the **manually named sidebar title**
+   (`session/title` with `source.kind === 'user'`), removing the old session's
+   entry first; with no manual name it falls back to the new session id (UUID).
+4. **Deliver the handoff document** via `agent.followup()` so the session starts
+   working.
+5. **Hide the old session**: `workspaceRegistry.archiveSession()` (retried with
+   `{ stopActivity: true }` when it is still active). It leaves the active list
+   but stays recoverable from the archive file.
+
+The failure branches for each step live in `runHandoff` (`src/handoff-host.js`);
+the order is not interchangeable.
 
 ## What it produces
 
@@ -42,23 +76,36 @@ was not given.
 
 ## How the new session is started
 
-1. The handoff event is built as a normal `user/message` (host rules only require
-   an id, `role: "user"`, a non-empty `source.kind`, and an array `content`).
-2. `agents.create({ sessionId, seed, inheritedEventCount, meta })` creates the
-   session with that event as its first event — the host persists it.
-3. The same text is then delivered through `agent.followup()` so the new session
-   starts working instead of sitting there holding a document.
+1. `agents.create({ sessionId, agentOptions, meta })` creates an **empty** session,
+   persisted by the host.
+2. The session is attached to the workspace (the host does not auto-attach sessions
+   created through `agents.create`, and without it the sidebar project group never
+   shows it).
+3. The handoff document is then delivered through `agent.followup()` so the
+   session starts working.
 
 If the host has no `agents.create`, the run fails with an explicit message and
-creates nothing.
+creates nothing (the old context is already archived; its path is in the detail).
 
-## Inheriting the session-bus name
+## Bus name: the manual sidebar title, otherwise the UUID
 
-If the source session is registered in `dsh-session-send`'s roster
-(`.dsh-bus/names.json`), the new session is registered as `<name>-handoff`
-(or `-handoff-2`, `-3`, … if taken). The roster is read-only here; writing goes
-through the bus's own registration entry when it exposes one. No existing name is
-ever overwritten, and names are clipped to 64 characters.
+The field is **`session.title`** — confirmed by reading the host source:
+`@deepseek-ai/dsh-client-ui-workspace/lib/client.js:999` renders session rows from
+`session.title?.trim()`; there is no `displayName` / `customName`. Renaming goes
+through `sessionTitle.rename()`, which appends a `session/title` event with
+`source: { kind: 'user' }`; generated titles are `provider` / `fallback`.
+
+So the only reliable test for "the user named this" is
+**`source.kind === 'user'` on the latest title snapshot**. Generated titles do not
+count (otherwise every session would register a name the user never chose).
+
+- Read path: `sessionQuery.readTitleSnapshot(sessionId)` (works for live and
+  historical sessions) → `sessionTitle.get(session)` → fall back to the new
+  session id (UUID);
+- With a manual name: register `<name>` itself, dropping the old session's entry
+  (name transfer);
+- If another session holds that name: fall back to `<name>-2`, `-3`, … and never
+  overwrite someone else's registration; names are clipped to 64 characters.
 
 ## Enabling it
 
@@ -66,6 +113,9 @@ ever overwritten, and names are clipped to 64 characters.
 // <project>/.dsh-bridge.json
 {
   "enabled": true,
+  "autoHandoff": true,
+  "handoffRounds": 15,
+  "archiveDir": ".dsh-archive",
   "todoLimit": 12,
   "recentTurns": 3,
   "openNewSession": true
@@ -74,17 +124,21 @@ ever overwritten, and names are clipped to 64 characters.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `enabled` | `false` | missing file or `false` = the menu row refuses to run and says how to enable it |
+| `enabled` | `true` | missing file counts as enabled; `false` stops both automatic and manual handoff |
+| `autoHandoff` | `true` | `false` keeps manual triggering only |
+| `handoffRounds` | `15` | hand off at this round (1–500); **re-read before every decision, so a change applies on the next turn** |
+| `archiveDir` | `.dsh-archive` | archive directory, relative to the project root or absolute |
 | `todoLimit` | `12` | todos listed in the document |
 | `recentTurns` | `3` | turns summarised into the document |
 | `openNewSession` | `true` | navigate the UI to the new session after it is created |
 
-Turning the switch on does not make anything run by itself — it only decides
-whether your click is allowed.
+No restart is needed after a config change: the file is re-read before every
+`turn/end` decision.
 
 ## UI
 
-- The session `…` menu row and a sidebar panel icon.
+- The session `…` menu row and a sidebar panel icon; the panel shows project /
+  switch / trigger mode / current round / archive dir / bus name.
 - Both are registered through the official slot registry. The client half has
   **no DOM-mutation observer, no manual container manipulation, no layout
   measurement, no timers** — enforced by `tests/client-safety.test.mjs`, which
@@ -96,10 +150,14 @@ whether your click is allowed.
 
 - The handoff covers what is **durable in the session log**. Work that only lives
   in your head is not in it.
-- `agents.create` is a host API; on a host without it, the plugin reports the
-  reason instead of pretending to succeed.
+- `agents.create` / `workspaceRegistry.archiveSession` are host APIs; on a host
+  without them the plugin reports the reason instead of pretending to succeed
+  (the archive file is still written).
 - The new session inherits the cwd and the source session as `parentSession`, not
-  the full parent history.
+  the full parent history — that lives in the archive JSON.
+- Automatic handoff swaps sessions at a turn boundary and makes no compaction
+  judgement. To keep "compact first, hand off only if that stops helping", set
+  `autoHandoff: false` and click when you decide.
 
 ## License
 

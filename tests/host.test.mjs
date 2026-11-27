@@ -59,20 +59,25 @@ test('makeSessionId 带 session- 前缀', () => {
 const SURFACE_TYPES = ['system/message', 'user/message', 'developer/message', 'assistant/message', 'tool/result']
 
 test('runHandoff 建会话时 seed 里不放任何 surface 事件', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'bridge-seed-'))
   const created = []
-  const realCtx = fakeCtx({ services: { agents: {
-    async create(options) {
-      created.push(options)
-      return { agent: { id: options.sessionId } }
-    },
-    get: () => undefined,
-  } } })
-  const result = await runHandoff(realCtx, {
-    sourceSessionId: 'session-src',
-    projectRoot: 'D:\openclaw-data\demo',
-    randomUUID: () => 'new',
-    config: {},
+  const realCtx = fakeCtx({
+    projectRoot: dir,
+    services: { workingDirectory: { get: () => dir }, agents: {
+      async create(options) {
+        created.push(options)
+        return { agent: { id: options.sessionId } }
+      },
+      get: () => undefined,
+    } },
   })
+  try {
+    const result = await runHandoff(realCtx, {
+      sourceSessionId: 'session-src',
+      projectRoot: dir,
+      randomUUID: () => 'new',
+      config: {},
+    })
   assert.equal(created.length, 1, '应当恰好建一个新会话')
   const options = created[0]
   const seed = options.seed
@@ -89,7 +94,10 @@ test('runHandoff 建会话时 seed 里不放任何 surface 事件', async () => 
   assert.ok(!('inheritedEventCount' in options) || options.inheritedEventCount === 0,
     '没有继承事件时 inheritedEventCount 必须是 0')
   assert.notEqual(options.meta && options.meta.isSeeded, true, '空会话不是 seeded 会话')
-  assert.equal(result.ok, true)
+    assert.equal(result.ok, true)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
 })
 
 test('seedAndWake 目标不存在时返回 ok:false 而不是抛', async () => {
@@ -218,7 +226,7 @@ test('runHandoff 建会话后把新会话 attach 进 workspace（否则侧栏项
   }
 })
 
-test('runHandoff 源会话有总线名时继承名字', async () => {
+test('runHandoff 用侧边栏手动名登记总线，并把旧会话的登记摘掉（名称转移）', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'bridge-name-'))
   try {
     await mkdir(join(dir, '.dsh-bus'), { recursive: true })
@@ -226,7 +234,6 @@ test('runHandoff 源会话有总线名时继承名字', async () => {
       join(dir, '.dsh-bus', 'names.json'),
       JSON.stringify({ 'session-src': { name: '管线维护', at: 1 } }),
     )
-    const registered = []
     const ctx = fakeCtx({
       projectRoot: dir,
       services: {
@@ -239,6 +246,24 @@ test('runHandoff 源会话有总线名时继承名字', async () => {
           get: () => ({ followup() {} }),
         },
         workingDirectory: { get: () => dir },
+        // 侧边栏手动命名 = session/title 事件，source.kind === 'user'
+        sessionQuery: {
+          async observeSession() {
+            const observation = {
+              events: [
+                {
+                  type: 'user/message',
+                  data: { turn: 1, message: { role: 'user', content: [{ type: 'text', text: '修一下登录' }] } },
+                },
+              ],
+            }
+            observation[Symbol.dispose] = () => {}
+            return observation
+          },
+          async readTitleSnapshot() {
+            return { session: { id: 'session-src' }, title: { title: '管线维护', source: { kind: 'user' } } }
+          },
+        },
       },
     })
     const result = await runHandoff(ctx, {
@@ -248,11 +273,103 @@ test('runHandoff 源会话有总线名时继承名字', async () => {
       randomUUID: () => 'n1',
     })
     assert.equal(result.ok, true)
-    assert.equal(result.name, '管线维护-handoff')
-    // 新会话应被真实写进 .dsh-bus/names.json（走总线 dsh_bus_register 同款写盘）
+    assert.equal(result.name, '管线维护', '注册名 = 侧边栏手动名本身（不加 -handoff 后缀）')
     const finalNames = await readNames(dir)
-    assert.equal(finalNames['session-src'].name, '管线维护', '源会话登记仍在')
-    assert.equal(finalNames['session-n1'].name, '管线维护-handoff', '新会话已接续总线注册')
+    assert.equal(finalNames['session-src'], undefined, '旧会话的登记被摘掉（名称转移，避免同名双 owner）')
+    assert.equal(finalNames['session-n1'].name, '管线维护', '新会话已接续总线注册')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('runHandoff 侧边栏未手动命名时注册名回退为新会话 id（UUID），不编造名字', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'bridge-noname-'))
+  try {
+    await mkdir(join(dir, '.dsh-bus'), { recursive: true })
+    await writeFile(
+      join(dir, '.dsh-bus', 'names.json'),
+      JSON.stringify({ 'session-src': { name: '管线维护', at: 1 } }),
+    )
+    const ctx = fakeCtx({
+      projectRoot: dir,
+      services: {
+        agents: {
+          async create(options) {
+            return { agent: { id: options.sessionId } }
+          },
+          get: () => ({ followup() {} }),
+        },
+        workingDirectory: { get: () => dir },
+        sessionQuery: {
+          async observeSession() {
+            const observation = {
+              events: [
+                {
+                  type: 'user/message',
+                  data: { turn: 1, message: { role: 'user', content: [{ type: 'text', text: '修一下登录' }] } },
+                },
+              ],
+            }
+            observation[Symbol.dispose] = () => {}
+            return observation
+          },
+          // 自动标题（provider 生成）不算手动命名
+          async readTitleSnapshot() {
+            return { session: { id: 'session-src' }, title: { title: '修复登录接口', source: { kind: 'provider' } } }
+          },
+        },
+      },
+    })
+    const result = await runHandoff(ctx, {
+      sourceSessionId: 'session-src',
+      agent: { session: { id: 'session-src' } },
+      config: {},
+      randomUUID: () => 'n2',
+    })
+    assert.equal(result.ok, true)
+    assert.equal(result.name, 'session-n2', '没有手动名时用新会话 id 注册')
+    const finalNames = await readNames(dir)
+    assert.equal(finalNames['session-n2'].name, 'session-n2')
+    assert.equal(finalNames['session-src'].name, '管线维护', '不手动命名时旧会话的登记保持不动')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('runHandoff 归档写盘失败时整体中止：不建会话、不登记总线、旧会话继续跑', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'bridge-abort-'))
+  try {
+    const created = []
+    // 先用一个**文件**占住归档目录名 → mkdir(recursive) 必然 ENOTDIR
+    await writeFile(join(dir, 'not-a-dir'), 'x', 'utf8')
+    const ctx = fakeCtx({
+      projectRoot: dir,
+      services: {
+        agents: {
+          async create(options) {
+            created.push(options)
+            return { agent: { id: options.sessionId } }
+          },
+          get: () => ({ followup() {} }),
+        },
+        workingDirectory: { get: () => dir },
+        workspaceRegistry: { list: () => [] },
+      },
+    })
+    const result = await runHandoff(ctx, {
+      sourceSessionId: 'session-src',
+      agent: { session: { id: 'session-src' } },
+      // 合法的项目根，但归档目录是一个已存在的**文件** → mkdir 必然 ENOTDIR
+      config: { archiveDir: 'not-a-dir' },
+      randomUUID: () => 'abort1',
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.aborted, true)
+    assert.equal(result.abortReason, 'archive')
+    assert.equal(created.length, 0, '归档失败绝不允许建新会话')
+    assert.ok(result.detail.includes('未建新会话'), `detail 要讲清没建：${result.detail}`)
+    const names = await readNames(dir)
+    assert.deepEqual(names, {}, '归档失败绝不允许登记总线')
   } finally {
     await rm(dir, { recursive: true, force: true })
   }

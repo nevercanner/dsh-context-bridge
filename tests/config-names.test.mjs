@@ -25,11 +25,22 @@ test('只有显式 false 才关闭', () => {
   assert.equal(normalizeConfig({}).enabled, true)
 })
 
-test('配置里没有自动触发参数（纯手动）', () => {
-  const config = normalizeConfig({ enabled: true, thresholdTokens: 1234, autoContinue: true, minIntervalMs: 5 })
-  assert.equal('thresholdTokens' in config, false, '手动模式下不应有阈值参数')
-  assert.equal('autoContinue' in config, false, '手动模式下不应有 autoContinue')
-  assert.equal('minIntervalMs' in config, false, '手动模式下不应有冷却参数')
+test('自动交接的开关与阈值有默认值（15 轮），且不是「猜 token」式的参数', () => {
+  const config = normalizeConfig({ enabled: true, thresholdTokens: 1234, minIntervalMs: 5 })
+  assert.equal(config.autoHandoff, true, '默认开启自动交接')
+  assert.equal(config.handoffRounds, 15, '默认 15 轮')
+  assert.equal('thresholdTokens' in config, false, '按轮次触发，不按 token 猜')
+  assert.equal('minIntervalMs' in config, false, '没有冷却计时器')
+  const custom = normalizeConfig({ handoffRounds: 20, autoHandoff: false })
+  assert.equal(custom.handoffRounds, 20)
+  assert.equal(custom.autoHandoff, false)
+})
+
+test('handoffRounds 越界被夹紧、垃圾值退回 15', () => {
+  assert.equal(normalizeConfig({ handoffRounds: 0 }).handoffRounds, 1)
+  assert.equal(normalizeConfig({ handoffRounds: 9999 }).handoffRounds, 500)
+  assert.equal(normalizeConfig({ handoffRounds: 'x' }).handoffRounds, 15)
+  assert.equal(normalizeConfig({ handoffRounds: 7.6 }).handoffRounds, 7)
 })
 
 test('normalizeConfig 夹紧越界条数', () => {

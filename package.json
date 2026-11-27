@@ -1,7 +1,7 @@
 {
   "name": "dsh-context-bridge",
-  "version": "0.1.5",
-  "description": "Automatic handoff for DSH sessions: build a compact handoff document from project facts, context summary and todos, then create and wake a new session with it.",
+  "version": "0.2.0",
+  "description": "会话交接：跑到 15 轮（可配）自动强制交接——旧上下文完整归档、新会话接续、用侧边栏会话名注册到总线；也支持手动触发。",
   "type": "module",
   "main": "src/index.js",
   "exports": {
