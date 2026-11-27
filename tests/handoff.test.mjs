@@ -1,6 +1,14 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { buildHandoff, digestSummary, latestCompactionSummary, recentTurns, todosFromEvents } from '../src/handoff.js'
+import {
+  buildHandoff,
+  digestSummary,
+  latestCompactionSummary,
+  recentTurns,
+  todosFromEvents,
+  toolTrail,
+  userRequests,
+} from '../src/handoff.js'
 
 const events = [
   {
@@ -92,4 +100,82 @@ test('buildHandoff 空输入也能产出可用骨架', () => {
   const text = buildHandoff({ projectRoot: '', todos: [], summaryLines: [], recent: [] })
   assert.ok(text.includes('## 现在要做什么'))
   assert.ok(text.includes('## 项目事实'))
+})
+
+// ── 真实事件形状回归 ────────────────────────────────────────────────
+// 宿主真实日志：user/message 只有 data.content（没有 turn、没有 message 包装），
+// 轮次在 turn/start 上。旧实现只认 data.turn，用户消息被整段丢掉，交接文档
+// 于是永远只剩「源会话没有留下明确的当前任务」。
+const realEvents = [
+  { type: 'turn/start', data: { turn: 1 } },
+  { type: 'user/message', data: { content: [{ type: 'text', text: '把登录改成 token 方式' }] } },
+  { type: 'assistant/message', data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: '已改完 auth 中间件' }] } } },
+  { type: 'tool/call', data: { turn: 1, name: 'edit', arguments: '{"file_path":"src/auth.js","old_string":"a","new_string":"b"}' } },
+  { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
+  { type: 'turn/start', data: { turn: 2 } },
+  { type: 'user/message', data: { content: [{ type: 'text', text: '补上 token 过期测试，再跑一遍 npm test' }] } },
+  { type: 'tool/call', data: { turn: 2, name: 'ops_bash', arguments: '{"description":"跑测试","command":"npm test"}' } },
+  { type: 'assistant/message', data: { turn: 2, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: '61 pass' }] } } },
+  { type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } },
+]
+
+test('recentTurns 认得真实形状：用户消息没有 turn，靠 turn/start 归位', () => {
+  const turns = recentTurns(realEvents, 3)
+  assert.deepEqual(turns.map((item) => item.turn), [1, 2])
+  assert.equal(turns[1].ask, '补上 token 过期测试，再跑一遍 npm test')
+  assert.ok(turns[0].did.includes('auth'))
+})
+
+test('recentTurns 在完全没有 turn 标记时退化成「一条用户消息一轮」', () => {
+  const bare = [
+    { type: 'user/message', data: { content: [{ type: 'text', text: '第一件事' }] } },
+    { type: 'user/message', data: { content: [{ type: 'text', text: '第二件事' }] } },
+  ]
+  const turns = recentTurns(bare, 5)
+  assert.deepEqual(turns.map((item) => item.ask), ['第一件事', '第二件事'])
+  assert.deepEqual(turns.map((item) => item.turn), [1, 2])
+})
+
+test('userRequests 逐字带上最近几条要求（待办为空时的唯一保障）', () => {
+  const requests = userRequests(realEvents, { limit: 1 })
+  assert.equal(requests.length, 1)
+  assert.equal(requests[0].turn, 2)
+  assert.ok(requests[0].text.includes('npm test'))
+})
+
+test('toolTrail 统计调用次数并挑出能说明动作的参数', () => {
+  const trail = toolTrail(realEvents)
+  assert.equal(trail.total, 2)
+  assert.equal(trail.items[0].name, 'edit')
+  assert.ok(trail.items[0].hint.includes('src/auth.js'))
+  assert.equal(trail.items[1].name, 'ops_bash')
+  assert.equal(trail.items[1].hint, '跑测试')
+})
+
+test('buildHandoff 在待办为空时用最后一条用户要求填「现在要做什么」', () => {
+  const text = buildHandoff({
+    projectRoot: 'D:\proj',
+    todos: [],
+    recent: recentTurns(realEvents, 3),
+    requests: userRequests(realEvents, { limit: 3 }),
+    toolTrail: toolTrail(realEvents),
+  })
+  assert.ok(text.includes('- 用户最后的要求：补上 token 过期测试'))
+  assert.ok(text.includes('## 用户最近的原始要求'))
+  assert.ok(text.includes('ops_bash「跑测试」'))
+  assert.ok(!text.includes('（源会话没有留下明确的当前任务'))
+})
+
+test('buildHandoff 把归档路径写进文档头（否则新会话看不到归档）', () => {
+  const text = buildHandoff({
+    projectRoot: 'D:\proj',
+    archivePath: 'D:\proj\.dsh-archive\session-abc-2026.json',
+    eventCount: 4,
+    turnCount: 2,
+    requests: userRequests(realEvents, { limit: 1 }),
+  })
+  assert.ok(text.includes('旧上下文已完整归档'))
+  assert.ok(text.includes('session-abc-2026.json'))
+  assert.ok(text.includes('4 条事件'))
+  assert.match(text, /read 这个文件/)
 })

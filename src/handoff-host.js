@@ -23,7 +23,16 @@
  */
 
 import { readNames, nameIndex, nameOf, pickFreeName, writeName } from './bus-names.js'
-import { buildHandoff, digestSummary, latestCompactionSummary, recentTurns, todosFromEvents } from './handoff.js'
+import {
+  buildHandoff,
+  digestSummary,
+  latestCompactionSummary,
+  recentTurns,
+  todosFromEvents,
+  toolTrail,
+  userRequests,
+} from './handoff.js'
+import { countTurns } from './rounds.js'
 import { writeContextArchive } from './archive.js'
 import { resolve } from './ctx-services.js'
 import { readManualSessionName, titleTextOf } from './session-name.js'
@@ -254,6 +263,12 @@ export async function collectHandoffInput(ctx, { sessionId, agent, projectRoot, 
     todos: todosFromEvents(events),
     summaryLines: digestSummary(latestCompactionSummary(events)),
     recent: recentTurns(events, recentTurnCount),
+    // 下面三项是「文档不空」的保险：待办（tool-todo）和摘要（compaction）
+    // 在本机默认都没启用，只有原始要求与工具轨迹一定存在。
+    requests: userRequests(events, { limit: 3 }),
+    toolTrail: toolTrail(events),
+    turnCount: countTurns(events),
+    eventCount: events.length,
   }
 }
 
@@ -392,7 +407,6 @@ export async function runHandoff(ctx, input) {
     projectRoot,
     recentTurnCount: config.recentTurns ?? 3,
   })
-  const text = buildHandoff({ ...facts, todoLimit: config.todoLimit ?? 12 })
 
   // ── 1) 归档旧上下文（失败 = 整体中止）──────────────────────────────
   const snapshot = await readSessionSnapshot(ctx, sourceSessionId)
@@ -413,6 +427,15 @@ export async function runHandoff(ctx, input) {
       detail: `旧上下文归档失败，交接已中止（未建新会话、未登记总线，原会话继续运行）：${String(error)}`,
     }
   }
+
+  // 文档必须带着归档路径一起生成：没有这句，归档文件对新会话就是不可见的
+  // （它只看得到 followup 投进来的这一段文字）。所以 buildHandoff 排在归档之后。
+  const text = buildHandoff({
+    ...facts,
+    todoLimit: config.todoLimit ?? 12,
+    archivePath: archive.file,
+    eventCount: archive.eventCount,
+  })
 
   const agents = resolve(ctx, 'agents')
   if (agents === undefined || typeof agents.create !== 'function') {

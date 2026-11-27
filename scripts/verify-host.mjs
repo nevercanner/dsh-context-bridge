@@ -88,7 +88,11 @@ async function main() {
           async observeSession() {
             const observation = {
               events: [
-                { type: 'user/message', data: { turn: 1, message: { role: 'user', content: [{ type: 'text', text: '把这个插件做出来' }] } } },
+                // 真实形状：user/message 只有 content，没有 turn；轮次在 turn/start 上。
+                // 这个桩故意用真实形状，否则「文档为空」那个 bug 在自检里测不出来。
+                { type: 'turn/start', data: { turn: 1 } },
+                { type: 'user/message', data: { content: [{ type: 'text', text: '把这个插件做出来' }] } },
+                { type: 'tool/call', data: { turn: 1, step: 1, callId: 'c1', name: 'edit', arguments: '{"file_path":"src/index.js"}' } },
                 { type: 'assistant/message', data: { turn: 1, message: { role: 'assistant', content: [{ type: 'text', text: '做完一半' }] } } },
                 { type: 'todo/write', data: { turn: 1, todos: [{ content: '写 README', status: 'in_progress' }] } },
               ],
@@ -170,6 +174,11 @@ async function main() {
   check('不带 seed（surface 首家必须留给 system/message）', created[0]?.seed === undefined,
     `实际 seed=${JSON.stringify(created[0]?.seed)?.slice(0, 120)}`)
   check('投递了 1 条消息', pushed.length === 1)
+  const doc = String(pushed[0]?.content?.[0]?.text ?? '')
+  check('文档带上了用户原始要求（真实形状下也不丢）', doc.includes('把这个插件做出来'), doc.slice(0, 400))
+  check('文档带上了工具轨迹', doc.includes('edit「src/index.js」'), doc.slice(0, 600))
+  check('文档头写了归档文件路径（新会话能 read 到全文）',
+    doc.includes('旧上下文已完整归档') && doc.includes('.dsh-archive'), doc.slice(0, 300))
 
   console.log('5) 自动交接：跑到第 15 轮的 turn/end 就强制交接（不手动点）')
   const autoEvents = []

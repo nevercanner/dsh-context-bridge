@@ -60,19 +60,44 @@ the order is not interchangeable.
 
 ## What it produces
 
-A Markdown document with four sections — deliberately short, because a handoff
-that repeats the whole conversation would hit the same wall:
+A Markdown document, deliberately short, that quotes raw text only in the archive
+pointer line — details are delegated to the archive file:
 
-| Section | Content |
-|---|---|
-| 现在要做什么 | the in-progress todo, or the last turn's request and its conclusion |
-| 已经做到哪 | completed todos plus the latest compaction summary, clipped |
-| 下一步 | remaining todos, in order |
-| 项目事实 | working directory and the last few turns (ask → result) |
+| Section | Content | Source |
+|---|---|---|
+| header | source title/id, bus name, **archive file path**, scale (turns / events) | archive result |
+| 现在要做什么 | the in-progress todo, else the **user's last request verbatim** | `todo/write` → `user/message` |
+| 用户最近的原始要求 | last 3 user messages verbatim (600 chars each) | `user/message` |
+| 已经做到哪 | completed todos + compaction summary + tool-call trail (name + command/path) | `todo/write` / `compaction/summary` / `tool/call` |
+| 下一步 | remaining todos; when there are none it says so and points at the last request | `todo/write` |
+| 项目事实 | working directory and the last turns (ask → result) | turns derived from `turn/start` |
+| 注意 | sections may be empty, read the archive for the full text, check the repo first | — |
 
-Generated from the source session's own event log (`sessionQuery.observeSession`,
-read-only), not from a model call: it costs no tokens and cannot invent facts it
-was not given.
+Generated from the source session's own event log (`sessionQuery`, read-only), not
+from a model call: it costs no tokens and cannot invent facts it was not given.
+
+### Why it used to come out empty (a real v0.2.0 defect)
+
+Three structural causes, none of them related to archiving:
+
+1. **User messages were dropped entirely.** The host's real event shape is
+   `user/message → { content: [...] }` — **no `turn` field**; turns live on
+   `turn/start` / `turn/end` / `assistant/message` / `tool/call`. The old extractor
+   only accepted a message's own `data.turn`, so every user message was filtered
+   out: in one real 8,900-event log, **169 user messages, 0 of them carrying
+   `data.turn`** — `ask` was therefore always empty and the document said only
+   "(the source session left no current task)".
+2. **Todos were always empty.** They only come from `todo/write`, and this host has
+   the `tool-todo` plugin disabled — the same log has 0 `todo/write` events.
+3. **Summaries were mostly missing.** `compaction-basic` is often off too, so
+   `compaction/summary` may never appear.
+
+Since v0.3.0 turns are derived from `turn/start` (`turnMap`) and messages are
+stamped with the turn they belong to; two materials that **always** exist are added
+(verbatim requests, tool-call trail) plus the archive path in the header, so the new
+session can `read` the archive for full text. Archiving alone never solved this:
+the archive is write-only, and without that header line the new session does not
+even know the file exists.
 
 ## How the new session is started
 
